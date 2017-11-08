@@ -199,7 +199,7 @@ class SocketIOClient(object):
                 pass
 
             def on_disconnect(self, reason):
-                raise SocketIODisconnectedError(reason)
+                raise SocketIODisconnectedError('SocketIO websocket exection: ' + reason)
 
             def on_event(self, event, *args):
                 msg = SocketIOMSG(event, args[0] if args else None)
