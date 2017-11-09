@@ -2,6 +2,21 @@
 Changelog
 ##########
 
+0.8dr3
+=====
+* Based on 0.8dr2
+* Added proper handling of tcp ERRNO 35 in websocket part of socketio communication
+* All other tcp error would rise an exception so it would be easily tracked in report
+* If any other tcp ERROR occurs exception would be raised, which cause user scenario interrupt. On further access to client reconnect will be executed.
+
+
+0.8dr2
+=====
+* Based on 0.8dr1
+* Added config propagation. Locust able to be reconfigured without relounch
+* Added host setup through UI
+* HTTP error aggregation
+
 0.8dr1
 =====
 * Based on 0.8a2

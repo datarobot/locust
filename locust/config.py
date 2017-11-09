@@ -10,7 +10,7 @@ from urlparse import urlparse
 from .core import Locust
 from .log import setup_logging
 
-__all__ = ['configure', 'locust_config', 'process_options']
+__all__ = ['configure', 'locust_config', 'process_options', 'register_config']
 
 logger = logging.getLogger(__name__)
 
@@ -23,6 +23,16 @@ class LocustConfig(object):
         'socketio_logging': 'locust.clients.socketio',
         'http_logging': 'locust.clients.http',
     }
+
+    STATIC_PARAMS = [
+        'web_host',
+        'web_port',
+        'no_web',
+        'master_host',
+        'master_port',
+        'master_bind_host',
+        'master_bind_port',
+    ]
 
     DEFAULT = {
         # Endpoints
@@ -77,6 +87,16 @@ class LocustConfig(object):
             )
             sys.exit(1)
 
+    def to_dict(self):
+        """Return config object as raw dict"""
+        return self._config.copy()
+
+    def update_config(self, config_dict):
+        """Update config object with raw dict"""
+        for k, v in config_dict.items():
+            if k not in self.STATIC_PARAMS:
+                self._config[k] = v
+
     @property
     def host(self):
         config = self._config
@@ -97,15 +117,28 @@ class LocustConfig(object):
             self._config[attr] = value
 
 # global locust config singleton
-locust_config = LocustConfig()
+_locust_config = LocustConfig()
+
+def locust_config():
+    return _locust_config
+
+def register_config(config):
+    global _locust_config
+    """
+    Update default locust configuration object with custom instance
+    config argument should be instance of LocustConfig or inherited class
+    """
+    if not isinstance(config, LocustConfig):
+        raise AttributeError('Config object sgould be instance of LocustConfig')
+    _locust_config = config
 
 @contextmanager
 def configure():
     """locust configuration context manager"""
-    yield locust_config
+    yield _locust_config
 
 def process_options():
-    parser, opts, args = parse_options()
+    _parser, opts, args = parse_options()
     setup_logging(opts.loglevel, opts.logfile)
     with configure() as config:
         loglevel = opts.__dict__.pop('loglevel')
@@ -123,10 +156,10 @@ def process_options():
             setattr(config, attr, value)
 
     locusts = load_locusts(opts, args)
-    locust_config._apply()
-    locust_config._validate()
+    _locust_config._apply()
+    _locust_config._validate()
 
-    return locust_config, locusts
+    return _locust_config, locusts
 
 def parse_options():
     """

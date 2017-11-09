@@ -1,11 +1,8 @@
-# import inspect
 import logging
-# import os
 import signal
 import socket
 import sys
 import time
-# from optparse import OptionParser
 
 import gevent
 
@@ -28,9 +25,13 @@ version = locust.__version__
 
 main_greenlet = None
 
-def main():
-
-    options, locusts = config.process_options()
+def launch(options, locusts):
+    """
+    Locust entrypoint, could be called for programmatical launch:
+        * options - Any object which implements field access by attribute
+                    Recommended to use extended locust.config.LocustConfig object
+        * locusts - list of locust classes inherited from locust.core.Locust
+    """
     logger = logging.getLogger(__name__)
 
     if options.show_version:
@@ -78,14 +79,18 @@ def main():
         main_greenlet = runners.main.greenlet
 
     # Headful / headless init
-    if options.no_web and options.slave:
+    if options.slave:
         logger.info("Slave connected in headless mode")
     elif options.no_web and not options.slave:
         logger.info("Starting headless execution")
         runners.main.wait_for_slaves(options.expect_slaves)
         runners.main.start_hatching(options.num_clients, options.hatch_rate)
     else:
-        logger.info("Starting web monitor at %s:%s", options.web_host or "localhost", options.web_port)
+        logger.info(
+            "Starting web monitor at %s:%s",
+            options.web_host or "localhost",
+            options.web_port
+        )
         gevent.spawn(web.start, locusts, options)
 
     #### Stats, etc
@@ -121,6 +126,10 @@ def main():
         shutdown(code=code)
     except KeyboardInterrupt:
         shutdown(0)
+
+def main():
+    options, locusts = config.process_options()
+    launch(options, locusts)
 
 if __name__ == '__main__':
     main()
