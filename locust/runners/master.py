@@ -69,7 +69,10 @@ class MasterLocustRunner(DistributedLocustRunner):
             self.master.log_exception(msg.node_id, msg.data["msg"], msg.data["traceback"])
 
         def on_pong(self, msg):
-            self.master.slaves[msg.node_id].ping_answ = True
+            if msg.node_id in self.master.slaves.keys():
+                self.master.slaves[msg.node_id].ping_answ = True
+            else:
+                logger.warn('Unknown Slave pong: {}.'.format(msg.node_id))
 
 
     def __init__(self, locust_classes, options):

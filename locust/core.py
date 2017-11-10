@@ -353,9 +353,17 @@ class TaskSet(object):
                     self.fire_task_success(task_start_time)
                     self.wait()
                 self.locust.current_task = ""
-                if hasattr(self, 'on_task_end'):
-                    self.on_task_end()
-                    self.client.clear_context()
+                try:
+                    if hasattr(self, 'on_task_end'):
+                        self.on_task_end()
+                except Exception as e:
+                    self.fire_task_failure(
+                        task_start_time,
+                        e,
+                        'After Task Hook',
+                        task_name='After Task Hook'
+                )
+                self.client.clear_context()
             except InterruptTaskSet as e:
                 if e.reschedule:
                     six.reraise(RescheduleTaskImmediately, RescheduleTaskImmediately(e.reschedule), sys.exc_info()[2])
@@ -423,15 +431,15 @@ class TaskSet(object):
     def _sleep(self, seconds):
         gevent.sleep(seconds)
 
-    def fire_task_success(self, start_time):
+    def fire_task_success(self, start_time, task_name=self.locust.current_task):
         events.task_success.fire(
-            task_name=self.locust.current_task,
+            task_name=task_name,
             task_time=int((time() - start_time) * 1000)
         )
 
-    def fire_task_failure(self, start_time, reason, action):
+    def fire_task_failure(self, start_time, reason, action, task_name=self.locust.current_task):
         events.task_failure.fire(
-            task_name=self.locust.current_task,
+            task_name=task_name,
             task_time=int((time() - start_time) * 1000),
             exception=reason,
             action=action

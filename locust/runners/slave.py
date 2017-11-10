@@ -106,7 +106,10 @@ class SlaveLocustRunner(DistributedLocustRunner):
             events.node_report.fire(node_id=msg.node_id, data=msg.data)
 
         def on_pong(self, msg):
-            self.slave.workers[msg.node_id].ping_answ = True
+            if msg.node_id in self.slave.workers.keys():
+                self.slave.workers[msg.node_id].ping_answ = True
+            else:
+                logger.warn('Unknown Worker pong: {}.'.format(msg.node_id))
 
 
     @classmethod
@@ -143,7 +146,11 @@ class SlaveLocustRunner(DistributedLocustRunner):
 
         # listener that gathers info on how many locust users the slaves has spawned
         def on_worker_report(node_id, data):
-            self.workers[node_id].user_count = data["user_count"]
+            if node_id in self.workers:
+                self.workers[node_id].user_count = data["user_count"]
+            else:
+                logger.warn('Unknown Worker report: {}.'.format(node_id))
+
         events.node_report += on_worker_report
 
         # register listener that adds the current number of

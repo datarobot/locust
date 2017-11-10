@@ -152,7 +152,7 @@ class ExtendedSocketIO(SocketIO):
                     self._close()
                     raise
             except SocketIOConnectionError as e:
-                if e.errno == 35:
+                if e.errno in [11, 35]:
                     # EAGAIN error, no data for tcp connection for now
                     continue
 
