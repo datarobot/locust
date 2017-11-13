@@ -431,13 +431,15 @@ class TaskSet(object):
     def _sleep(self, seconds):
         gevent.sleep(seconds)
 
-    def fire_task_success(self, start_time, task_name=self.locust.current_task):
+    def fire_task_success(self, start_time, task_name=None):
+        task_name = self.locust.current_task if task_name is None else task_name
         events.task_success.fire(
             task_name=task_name,
             task_time=int((time() - start_time) * 1000)
         )
 
-    def fire_task_failure(self, start_time, reason, action, task_name=self.locust.current_task):
+    def fire_task_failure(self, start_time, reason, action, task_name=None):
+        task_name = self.locust.current_task if task_name is None else task_name
         events.task_failure.fire(
             task_name=task_name,
             task_time=int((time() - start_time) * 1000),

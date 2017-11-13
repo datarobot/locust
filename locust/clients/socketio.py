@@ -199,6 +199,13 @@ class SocketIOClient(object):
                 pass
 
             def on_disconnect(self, reason):
+                LocustEventHandler.request_failure.fire(
+                    request_type='SocketIO',
+                    name='Websocket connection',
+                    response_time=-1,
+                    exception=SocketIODisconnectedError('SocketIO websocket exection: ' + reason),
+                    task=client_wrapper.binded_locust.current_task
+                )
                 raise SocketIODisconnectedError('SocketIO websocket exection: ' + reason)
 
             def on_event(self, event, *args):

@@ -37,7 +37,7 @@ def fire_failure(meta, task, exception):
         response_time=meta["response_time"],
         exception=exception,
         task=task
-    )   
+    )
 
 class LocustResponse(Response):
 
