@@ -25,6 +25,16 @@ class MasterLocustRunner(DistributedLocustRunner):
         def __init__(self, master):
             self.master = master
 
+        def _validate_msg(fun):
+            def wraper(inst, msg):
+                msg.node_id = msg.node_id.encode('ascii')
+                if msg.node_id in inst.master.slaves.keys():
+                    fun(inst, msg)
+                else:
+                    logger.warn('Unknown Slave. Reply unknown: %s.', msg.node_id)
+                    inst.master.server.send_to(msg.node_id, Message("unknown", None, None))
+            return wraper
+
         def on_slave_ready(self, msg):
             id = msg.node_id.encode('ascii')
             self.master.slaves[id] = Node(id)
@@ -36,18 +46,22 @@ class MasterLocustRunner(DistributedLocustRunner):
             options = self.master.options.to_dict()
             self.master.server.send_to(id, Message("new_config", options, None))
 
+        @_validate_msg
         def on_slave_stopped(self, msg):
             del self.master.slaves[msg.node_id]
             if len(self.master.slaves.hatching + self.master.slaves.running) == 0:
                 self.master.state = STATE.STOPPED
                 logger.info("Removing %s slave from running slaves", msg.node_id)
 
+        @_validate_msg
         def on_stats(self, msg):
             events.node_report.fire(node_id=msg.node_id, data=msg.data)
 
+        @_validate_msg
         def on_hatching(self, msg):
             self.master.slaves[msg.node_id].state = STATE.HATCHING
 
+        @_validate_msg
         def on_hatch_complete(self, msg):
             self.master.slaves[msg.node_id].state = STATE.RUNNING
             self.master.slaves[msg.node_id].user_count = msg.data["count"]
@@ -56,6 +70,7 @@ class MasterLocustRunner(DistributedLocustRunner):
                 events.hatch_complete.fire(user_count=count)
                 self.master.state = STATE.RUNNING
 
+        @_validate_msg
         def on_quit(self, msg):
             if msg.node_id in self.master.slaves:
                 del self.master.slaves[msg.node_id]
@@ -65,14 +80,13 @@ class MasterLocustRunner(DistributedLocustRunner):
                     len(self.master.slaves.ready)
                 )
 
+        @_validate_msg
         def on_exception(self, msg):
             self.master.log_exception(msg.node_id, msg.data["msg"], msg.data["traceback"])
 
+        @_validate_msg
         def on_pong(self, msg):
-            if msg.node_id in self.master.slaves.keys():
-                self.master.slaves[msg.node_id].ping_answ = True
-            else:
-                logger.warn('Unknown Slave pong: {}.'.format(msg.node_id))
+            self.master.slaves[msg.node_id].ping_answ = True
 
 
     def __init__(self, locust_classes, options):

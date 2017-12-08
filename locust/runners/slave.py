@@ -22,7 +22,7 @@ logger = logging.getLogger(__name__)
 HEARTBEAT_INTERVAL = 3
 SLAVE_STATS_INTERVAL = 2
 WORKER_INIT_TIMEOUT = 30
-WORKER_GREENLET_RATE = 10
+WORKER_GREENLET_RATE = 20
 
 class SlaveLocustRunner(DistributedLocustRunner):
     """Master Locust runner. Represent master -> slave communication"""
@@ -40,6 +40,9 @@ class SlaveLocustRunner(DistributedLocustRunner):
 
         def on_new_config(self, msg):
             self.slave.options.update_config(msg.data)
+
+        def on_unknown(self, msg):
+            self.slave.client.send_all(Message("slave_ready", None, self.slave.slave_id))
 
         def on_stop(self, msg):
             logger.info("Got stop message from master, stopping...")
@@ -67,20 +70,34 @@ class SlaveLocustRunner(DistributedLocustRunner):
         def __init__(self, slave):
             self.slave = slave
 
+        def _validate_msg(fun):
+            def wraper(inst, msg):
+                msg.node_id = msg.node_id.encode('ascii')
+                if msg.node_id in inst.slave.workers.keys():
+                    fun(inst, msg)
+                else:
+                    logger.warn('Unknown Worker. Reply to quit: %s.', msg.node_id)
+                    inst.slave.server.send_to(
+                        msg.node_id, Message("quit", None, inst.slave.slave_id)
+                    )
+            return wraper
+        
         def on_worker_ready(self, msg):
             id = msg.node_id.encode('ascii')
             self.slave.workers[id] = Node(id)
             if len(self.slave.task_pool) > 0:
                 task = self.slave.task_pool.pop()
-                self.slave.server.send_to(id, Message("hatch", task, None))
+                self.slave.server.send_to(id, Message("hatch", task, self.slave.slave_id))
                 self.slave.workers[id].task = task
 
+        @_validate_msg
         def on_hatching(self, msg):
             self.slave.workers[msg.node_id].state = STATE.HATCHING
             state = [node.state == STATE.HATCHING for node in self.slave.workers.values()]
             if all(state):
                 self.slave.client.send_all(Message("hatching", None, self.slave.slave_id))
 
+        @_validate_msg
         def on_hatch_complete(self, msg):
             self.slave.workers[msg.node_id].state = STATE.RUNNING
             self.slave.workers[msg.node_id].user_count = msg.data["count"]
@@ -90,26 +107,26 @@ class SlaveLocustRunner(DistributedLocustRunner):
                 data = {"count": sum([w.user_count for w in self.slave.workers.values()])}
                 self.slave.client.send_all(Message("hatch_complete", data, self.slave.slave_id))
 
+        @_validate_msg
         def on_quit(self, msg):
-            if msg.node_id in self.slave.workers:
-                del self.slave.workers[msg.node_id]
-                logger.info(
-                    "worker %r quit. Currently %i workers connected.",
-                    msg.node_id,
-                    len(self.slave.workers.ready)
-                )
+            del self.slave.workers[msg.node_id]
+            logger.info(
+                "worker %r quit. Currently %i workers connected.",
+                msg.node_id,
+                len(self.slave.workers.ready)
+            )
 
+        @_validate_msg
         def on_exception(self, msg):
             self.slave.client.send_all(Message("exception", msg.data, self.slave.slave_id))
 
+        @_validate_msg
         def on_stats(self, msg):
             events.node_report.fire(node_id=msg.node_id, data=msg.data)
 
+        @_validate_msg
         def on_pong(self, msg):
-            if msg.node_id in self.slave.workers.keys():
-                self.slave.workers[msg.node_id].ping_answ = True
-            else:
-                logger.warn('Unknown Worker pong: {}.'.format(msg.node_id))
+            self.slave.workers[msg.node_id].ping_answ = True
 
 
     @classmethod
@@ -196,8 +213,8 @@ class SlaveLocustRunner(DistributedLocustRunner):
         ))
 
     def quit(self):
-        self.server.send_all(Message("quit", None, None))
-        self.client.send_all(Message("quit", None, None))
+        self.server.send_all(Message("quit", None, self.slave_id))
+        self.client.send_all(Message("quit", None, self.slave_id))
         self.greenlet.kill(block=True)
         self.server.close()
         self.client.close()
@@ -222,14 +239,14 @@ class SlaveLocustRunner(DistributedLocustRunner):
             gen = (w for w in self.workers.copy().itervalues() if not w.ping_answ)
             for dead_worker in gen:
                 logger.info("Worker does not respond. Killing it %s", dead_worker.id)
-                self.server.send_to(dead_worker.id, Message("quit", None, None))
+                self.server.send_to(dead_worker.id, Message("quit", None, self.slave_id))
                 self.task_pool.append(dead_worker.task)
                 del self.workers[dead_worker.id]
                 self.scheduled.append('worker')
 
             for worker in self.workers.itervalues():
                 worker.ping_answ = False
-                self.server.send_all(Message("ping", None, None))
+                self.server.send_all(Message("ping", None, self.slave_id))
             gevent.sleep(HEARTBEAT_INTERVAL)
 
     def start_hatching(self, locust_count, hatch_rate):
@@ -264,7 +281,7 @@ class SlaveLocustRunner(DistributedLocustRunner):
                 "num_clients": client_rate,
                 "num_requests": worker_num_requests
             }
-            self.server.send_to(slave_id, Message("hatch", data, None))
+            self.server.send_to(slave_id, Message("hatch", data, self.slave_id))
             self.workers[slave_id].task = data
 
         self.stats.start_time = time.time()

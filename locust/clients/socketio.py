@@ -12,7 +12,7 @@ import six
 import gevent
 from socketIO_client import SocketIO, BaseNamespace
 from socketIO_client.transports import WebsocketTransport, XHR_PollingTransport
-from socketIO_client.exceptions import TimeoutError, PacketError
+from socketIO_client.exceptions import TimeoutError, PacketError, ConnectionError
 from socketIO_client.symmetries import SSLError
 from socketIO_client.parsers import parse_packet_text
 try:
@@ -185,7 +185,10 @@ class SocketIOClient(object):
         self._namespace = namespace
         self._is_active = True
         self.__socket = None
-        self._connect(host, resource, namespace)
+        try:
+            self._connect(host, resource, namespace)
+        except ConnectionError as e:
+            raise RescheduleTask(e, 'connect')
 
     def _connect(self, host, resource, namespace):
         client_wrapper = self
@@ -215,7 +218,7 @@ class SocketIOClient(object):
         self.__socket = ExtendedSocketIO(
             host,
             verify=True,
-            wait_for_connection=True,
+            wait_for_connection=False,
             resource=resource
         )
         gevent.sleep(0.5)
