@@ -40,6 +40,8 @@ class TestHttpSession(WebserverTestCase):
         """
         Test a request to an endpoint that returns a streaming response
         """
+        from locust.clients.http import logger
+        logger.setLevel('WARN')
         s = HttpSession(Locust, "http://127.0.0.1:%i" % self.port)
         r = s.get("/streaming/30")
         

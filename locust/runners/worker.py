@@ -280,7 +280,7 @@ class WorkerLocustRunner(LocustRunner):
         events.locust_error += on_locust_error
 
         self.greenlet.spawn(self.slave_listener).link_exception(callback=noop)
-        gevent.sleep(0.5)
+        gevent.sleep(2)
         self.client.send_all(Message("worker_ready", None, self.worker_id))
         self.greenlet.spawn(self.stats_reporter).link_exception(callback=noop)
 

@@ -37,7 +37,7 @@ def fire_failure(meta, task, exception):
         response_time=meta["response_time"],
         exception=exception,
         task=task
-    )   
+    )
 
 class LocustResponse(Response):
 
@@ -236,7 +236,7 @@ class HttpSession(LoggedSession):
                 response.raise_for_status()
             except HTTPError as exception:
                 error = exception.message.split('for url:')[0]
-                message = "{}for: {} {} ".format(error, method, request_meta["name"])
+                message = "{} for: {} {} ".format(error, method, request_meta["name"])
                 exception = exception.__class__(
                     message,
                     request=exception.request,

@@ -12,7 +12,7 @@ import six
 import gevent
 from socketIO_client import SocketIO, BaseNamespace
 from socketIO_client.transports import WebsocketTransport, XHR_PollingTransport
-from socketIO_client.exceptions import TimeoutError, PacketError
+from socketIO_client.exceptions import TimeoutError, PacketError, ConnectionError
 from socketIO_client.symmetries import SSLError
 from socketIO_client.parsers import parse_packet_text
 try:
@@ -152,7 +152,7 @@ class ExtendedSocketIO(SocketIO):
                     self._close()
                     raise
             except SocketIOConnectionError as e:
-                if e.errno == 35:
+                if e.errno in [11, 35]:
                     # EAGAIN error, no data for tcp connection for now
                     continue
 
@@ -185,7 +185,10 @@ class SocketIOClient(object):
         self._namespace = namespace
         self._is_active = True
         self.__socket = None
-        self._connect(host, resource, namespace)
+        try:
+            self._connect(host, resource, namespace)
+        except ConnectionError as e:
+            raise RescheduleTask(e, 'connect')
 
     def _connect(self, host, resource, namespace):
         client_wrapper = self
@@ -198,7 +201,16 @@ class SocketIOClient(object):
             def on_reconnect(self):
                 pass
 
-            def on_disconnect(self, reason):
+            def on_disconnect(self, reason='unknown reason'):
+                if not client_wrapper._is_active:
+                    return
+                LocustEventHandler.request_failure.fire(
+                    request_type='SocketIO',
+                    name='Websocket connection',
+                    response_time=-1,
+                    exception=SocketIODisconnectedError('SocketIO websocket exection: ' + reason),
+                    task=client_wrapper.binded_locust.current_task
+                )
                 raise SocketIODisconnectedError('SocketIO websocket exection: ' + reason)
 
             def on_event(self, event, *args):
@@ -208,7 +220,7 @@ class SocketIOClient(object):
         self.__socket = ExtendedSocketIO(
             host,
             verify=True,
-            wait_for_connection=True,
+            wait_for_connection=False,
             resource=resource
         )
         gevent.sleep(0.5)
@@ -228,7 +240,6 @@ class SocketIOClient(object):
                     self.__socket.connect(path)
                 gevent.sleep(0.5)
             if not self.__socket.connected:
-                self._is_active = False
                 self.close()
                 raise SocketIOConnectionError('Unable to restore socket connection')
         return self.__socket
@@ -241,8 +252,12 @@ class SocketIOClient(object):
 
     def close(self):
         """Close socketIO connection"""
+        if not self._is_active:
+            return
+        self._is_active = False
+        if self._namespace:
+            self._socket.disconnect(self._namespace)
         self._socket.disconnect()
-        self._socket.disconnect(self._namespace)
         logger.debug("Closed socketIO connection. Client id: %s", self.client_id)
 
     def _receive(self, msg):

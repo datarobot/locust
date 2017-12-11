@@ -65,7 +65,7 @@ class LocustConfig(object):
         'http_logging': 'ERROR',
         'socketio_logging': 'ERROR',
         'zmq_logging': 'ERROR',
-        'locust_logging': 'ERROR',
+        'locust_logging': 'WARN',
         'logfile': None
     }
 
