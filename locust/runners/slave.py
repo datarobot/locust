@@ -81,7 +81,7 @@ class SlaveLocustRunner(DistributedLocustRunner):
                         msg.node_id, Message("quit", None, inst.slave.slave_id)
                     )
             return wraper
-        
+
         def on_worker_ready(self, msg):
             id = msg.node_id.encode('ascii')
             self.slave.workers[id] = Node(id)

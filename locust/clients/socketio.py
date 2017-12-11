@@ -201,7 +201,9 @@ class SocketIOClient(object):
             def on_reconnect(self):
                 pass
 
-            def on_disconnect(self, reason):
+            def on_disconnect(self, reason='unknown reason'):
+                if not client_wrapper._is_active:
+                    return
                 LocustEventHandler.request_failure.fire(
                     request_type='SocketIO',
                     name='Websocket connection',
@@ -238,7 +240,6 @@ class SocketIOClient(object):
                     self.__socket.connect(path)
                 gevent.sleep(0.5)
             if not self.__socket.connected:
-                self._is_active = False
                 self.close()
                 raise SocketIOConnectionError('Unable to restore socket connection')
         return self.__socket
@@ -251,8 +252,12 @@ class SocketIOClient(object):
 
     def close(self):
         """Close socketIO connection"""
+        if not self._is_active:
+            return
+        self._is_active = False
+        if self._namespace:
+            self._socket.disconnect(self._namespace)
         self._socket.disconnect()
-        self._socket.disconnect(self._namespace)
         logger.debug("Closed socketIO connection. Client id: %s", self.client_id)
 
     def _receive(self, msg):

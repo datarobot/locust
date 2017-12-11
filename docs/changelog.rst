@@ -2,6 +2,13 @@
 Changelog
 ##########
 
+0.8dr4
+=====
+* Based on 0.8dr3
+* Various stabilization improvements and fixes:
+** Ignoring unkonwn nodes
+** Handling socket-io EAGAIN tcp statuses
+
 0.8dr3
 =====
 * Based on 0.8dr2

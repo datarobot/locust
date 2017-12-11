@@ -356,6 +356,9 @@ class TaskSet(object):
                 try:
                     if hasattr(self, 'on_task_end'):
                         self.on_task_end()
+                    self.client.clear_context()
+                except InterruptTaskSet as e:
+                    raise e
                 except Exception as e:
                     self.fire_task_failure(
                         task_start_time,
@@ -363,7 +366,6 @@ class TaskSet(object):
                         'After Task Hook',
                         task_name='After Task Hook'
                 )
-                self.client.clear_context()
             except InterruptTaskSet as e:
                 if e.reschedule:
                     six.reraise(RescheduleTaskImmediately, RescheduleTaskImmediately(e.reschedule), sys.exc_info()[2])

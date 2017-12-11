@@ -1,3 +1,4 @@
+import logging
 import socketio
 import gevent
 from gevent import pywsgi
@@ -5,6 +6,8 @@ from locust.clients import SocketIOClient
 from locust.stats import global_stats
 from locust import config
 from .testcases import LocustTestCase
+
+logging.getLogger('socketio').setLevel('WARN')
 
 class SimpleSocketIOServer(object):
 
@@ -103,13 +106,6 @@ class TestSocketIO(LocustTestCase):
         self.assertIn({'sync_message': {'key': 'value'}}, self.server.messages)
         self.assertEqual(result.payload, {'key1': 'value1'})
 
-    def test_reconnect(self):
-        self.client = SocketIOClient(Locust, 'http://127.0.0.1:8081', 'socket.io', '')
-        self.client.send_async('self_disconnect', {})
-        self.assertEqual(len(self.server.clients), 0)
-        self.client._socket.wait(1)
-        self.assertEqual(len(self.server.clients), 1)
-
     def test_wait_for_message(self):
         self.client = SocketIOClient(Locust, 'http://127.0.0.1:8081', 'socket.io', '')
         self.client.send_async('wait_for_message', ['long_wait'])
@@ -141,10 +137,9 @@ class TestSocketIO(LocustTestCase):
         result = self.client.send_sync('sync_message', payload, response='reply-sync-message')
         self.assertIn({'sync_message': {'key': 'value'}}, self.server.messages)
         self.assertEqual(result.payload, {'key1': 'value1'})
+        self.client._is_active = False
         self.client.send_async('self_disconnect', {})
         self.assertEqual(len(self.server.clients), 0)
-        self.client._socket.wait(1)
-        self.assertEqual(len(self.server.clients), 2)
 
     def test_stats_tracking(self):
         self.client = SocketIOClient(Locust, 'http://127.0.0.1:8081', 'socket.io', '')

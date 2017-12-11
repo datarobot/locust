@@ -315,6 +315,7 @@ class TestLocustTaskStatistics(unittest.TestCase):
             @task
             def t1(self):
                 pass
+        
         loc = MyTasks(self.locust)
         self.assertRaises(RescheduleTask, lambda: loc.run())
         self.assertEqual(len(global_stats.tasks), 1)
