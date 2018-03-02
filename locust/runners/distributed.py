@@ -14,6 +14,7 @@ class Node(object):
         self.state = state
         self.user_count = 0
         self.ping_answ = True
+        self.ping_missed = 0
         self.worker_count = 0
         self.task = None
 

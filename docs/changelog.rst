@@ -2,6 +2,12 @@
 Changelog
 ##########
 
+0.8dr5
+=====
+* Based on 0.8dr4
+* Moved from process fork to subprocess spawn
+* Changed ping-pong logic for missed ping calculation
+
 0.8dr4
 =====
 * Based on 0.8dr3
