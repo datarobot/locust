@@ -116,6 +116,12 @@ class LocustConfig(object):
         else:
             self._config[attr] = value
 
+    def __getstate__(self):
+        return self.__dict__
+    
+    def __setstate__(self, d):
+        self.__dict__.update(d)
+
 # global locust config singleton
 _locust_config = LocustConfig()
 

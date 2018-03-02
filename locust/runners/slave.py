@@ -1,10 +1,12 @@
 """Slave Locust runner. Represent distributed worker sceduler process"""
-import logging
-import uuid
-import time
-import socket
+import os
 import sys
-from multiprocessing import Process
+import time
+import uuid
+import pickle
+import socket
+import logging
+import subprocess
 from contextlib import contextmanager
 
 import gevent
@@ -36,12 +38,13 @@ class SlaveLocustRunner(DistributedLocustRunner):
         def on_hatch(self, msg):
             self.slave.state = STATE.HATCHING
             self.slave.options.num_requests = msg.data["num_requests"]
-            self.slave.start_hatching(msg.data["num_clients"], msg.data["hatch_rate"])
+            self.slave.greenlet.spawn(self.slave.start_hatching, msg.data["num_clients"], msg.data["hatch_rate"])
 
         def on_new_config(self, msg):
             self.slave.options.update_config(msg.data)
 
         def on_unknown(self, msg):
+            self.slave.server.send_all(Message("stop", None, None))
             self.slave.client.send_all(Message("slave_ready", None, self.slave.slave_id))
 
         def on_stop(self, msg):
@@ -58,10 +61,9 @@ class SlaveLocustRunner(DistributedLocustRunner):
         def on_ping(self, msg):
             self.slave.client.send_all(Message("pong", None, self.slave.slave_id))
             if self.slave.scheduled:
-                with self.slave.zmq_listener_pause():
-                    for _ in range(len(self.slave.scheduled)):
-                        self.slave.scheduled.pop()
-                        self.slave.spawn_worker()
+                for _ in range(len(self.slave.scheduled)):
+                    self.slave.scheduled.pop()
+                    self.slave.spawn_worker()
 
 
     class SlaveServerHandler(object):
@@ -85,6 +87,8 @@ class SlaveLocustRunner(DistributedLocustRunner):
         def on_worker_ready(self, msg):
             id = msg.node_id.encode('ascii')
             self.slave.workers[id] = Node(id)
+            options = self.slave.options.to_dict()
+            self.slave.server.send_to(id, Message("new_config", options, None))
             if len(self.slave.task_pool) > 0:
                 task = self.slave.task_pool.pop()
                 self.slave.server.send_to(id, Message("hatch", task, self.slave.slave_id))
@@ -127,21 +131,7 @@ class SlaveLocustRunner(DistributedLocustRunner):
         @_validate_msg
         def on_pong(self, msg):
             self.slave.workers[msg.node_id].ping_answ = True
-
-
-    @classmethod
-    def spawn(self, locust_classes, options, parent):
-        parent.server.close()
-        try:
-            parent.greenlet.kill(block=True)
-        except GreenletExit:
-            pass
-        gevent.reinit()
-        events.clear_events_handlers()
-        stats.subscribe_stats()
-        runner = SlaveLocustRunner(locust_classes, options)
-        runner.greenlet.join()
-        sys.exit(0)
+            self.slave.workers[msg.node_id].ping_missed = 0
 
     def __init__(self, locust_classes, options):
         super(SlaveLocustRunner, self).__init__(locust_classes, options)
@@ -151,8 +141,7 @@ class SlaveLocustRunner(DistributedLocustRunner):
         self.greenlet = Group()
         self.task_pool = []
         self.scheduled = []
-        self.worker_listener = None
-
+        
         self.client = rpc.SlaveClient(self.master_host, self.master_port, self.slave_id)
         self.client.bind_handler(self.SlaveClientHandler(self))
 
@@ -183,6 +172,7 @@ class SlaveLocustRunner(DistributedLocustRunner):
         events.quitting += on_quitting
 
         self.greenlet.spawn(self.master_listener).link_exception(callback=self.noop)
+        self.greenlet.spawn(self.workers_listener).link_exception(callback=self.noop)
 
         gevent.sleep(0.5)
         self.client.send_all(Message("slave_ready", None, self.slave_id))
@@ -194,22 +184,26 @@ class SlaveLocustRunner(DistributedLocustRunner):
         return len(self.workers)
 
     def spawn_worker(self):
-        pid = Process(target=WorkerLocustRunner.spawn, args=(
-            self.locust_classes,
-            self.options,
-            self
-        ))
-        pid.start()
+        path = os.path.dirname(os.path.abspath(__file__)) + '/subrunner.py'
+        options = pickle.dumps(self.options)
+        command = "{} {} --process worker --options \"{}\"".format(
+            sys.executable, path, options
+        )
+        locusts = [sys.modules[lc.__module__].__file__ for lc in self.locust_classes]
+        command += ' ' + ' '.join(locusts)
+        subprocess.Popen([command], shell=True)
 
     def wait_for_workers(self, n=0):
+        current_workers = len(self.workers)
         counter = 0
         while counter <= WORKER_INIT_TIMEOUT:
-            if len(self.workers) >= n:
+            if len(self.workers) >= current_workers + n:
                 return
-            gevent.sleep(2)
-            counter += 2
+            start_time = time.time()
+            gevent.sleep(0.5)
+            counter += time.time() - start_time
         raise Exception("Only {} workers connected from expected {}".format(
-            len(self.workers), n
+            len(self.workers), current_workers + n
         ))
 
     def quit(self):
@@ -222,10 +216,12 @@ class SlaveLocustRunner(DistributedLocustRunner):
     def master_listener(self):
         while True:
             self.client.recv()
+            gevent.sleep()
 
     def workers_listener(self):
         while True:
             self.server.recv()
+            gevent.sleep()
 
     def stats_reporter(self):
         while True:
@@ -238,30 +234,35 @@ class SlaveLocustRunner(DistributedLocustRunner):
         while True:
             gen = (w for w in self.workers.copy().itervalues() if not w.ping_answ)
             for dead_worker in gen:
-                logger.info("Worker does not respond. Killing it %s", dead_worker.id)
-                self.server.send_to(dead_worker.id, Message("quit", None, self.slave_id))
-                self.task_pool.append(dead_worker.task)
-                del self.workers[dead_worker.id]
-                self.scheduled.append('worker')
+                if dead_worker.ping_missed > 2:
+                    logger.info("Worker does not respond. Killing it %s", dead_worker.id)
+                    self.server.send_to(dead_worker.id, Message("quit", None, self.slave_id))
+                    self.task_pool.append(dead_worker.task)
+                    del self.workers[dead_worker.id]
+                    self.scheduled.append('worker')
+                else:
+                    dead_worker.ping_missed += 1
 
             for worker in self.workers.itervalues():
                 worker.ping_answ = False
-                self.server.send_all(Message("ping", None, self.slave_id))
+            self.server.send_all(Message("ping", None, self.slave_id))
             gevent.sleep(HEARTBEAT_INTERVAL)
 
     def start_hatching(self, locust_count, hatch_rate):
-        with self.zmq_listener_pause():
-            self.state = STATE.HATCHING
-            worker_num = locust_count // WORKER_GREENLET_RATE + 1
+        self.state = STATE.HATCHING
+        worker_num = locust_count // WORKER_GREENLET_RATE + 1
 
-            if self.state != STATE.RUNNING and self.state != STATE.HATCHING:
-                self.stats.clear_all()
-                events.master_start_hatching.fire()
+        if self.state != STATE.RUNNING and self.state != STATE.HATCHING:
+            self.stats.clear_all()
+            events.master_start_hatching.fire()
 
-            for _ in range(worker_num):
+        total = 0
+        for worker_injection in [20] * (worker_num // 20) + [worker_num - 20 * (worker_num // 20)]:
+            for _ in range(worker_injection):
+                total += 1
                 self.spawn_worker()
-
-        self.wait_for_workers(worker_num)
+                gevent.sleep(0)
+            self.wait_for_workers(worker_injection)
 
         leftover = locust_count - (locust_count / worker_num) * worker_num
         adjust = lambda x: 1 if x <= leftover else 0
@@ -283,14 +284,7 @@ class SlaveLocustRunner(DistributedLocustRunner):
             }
             self.server.send_to(slave_id, Message("hatch", data, self.slave_id))
             self.workers[slave_id].task = data
+            gevent.sleep(0)
 
         self.stats.start_time = time.time()
         self.state = STATE.HATCHING
-
-    @contextmanager
-    def zmq_listener_pause(self):
-        if self.worker_listener:
-            self.worker_listener.kill(block=True)
-        yield
-        self.worker_listener = self.greenlet.spawn(self.workers_listener)
-        self.worker_listener.link_exception(callback=self.noop)

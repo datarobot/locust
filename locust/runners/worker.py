@@ -218,6 +218,9 @@ class WorkerLocustRunner(LocustRunner):
                 )
             )
 
+        def on_new_config(self, msg):
+            self.worker.options.update_config(msg.data)
+
         def on_stop(self, msg):
             events.quitting.fire()
 
@@ -226,22 +229,6 @@ class WorkerLocustRunner(LocustRunner):
 
         def on_ping(self, msg):
             self.worker.client.send_all(Message("pong", None, self.worker.worker_id))
-
-
-    @classmethod
-    def spawn(self, locust_classes, options, parent):
-        parent.server.close()
-        parent.client.close()
-        try:
-            parent.greenlet.kill(block=True)
-        except GreenletExit:
-            pass
-        gevent.reinit()
-        events.clear_events_handlers()
-        stats.subscribe_stats()
-        runner = WorkerLocustRunner(locust_classes, options)
-        runner.greenlet.join()
-        sys.exit(0)
 
     def __init__(self, locust_classes, options):
         super(WorkerLocustRunner, self).__init__(locust_classes, options)
@@ -279,9 +266,9 @@ class WorkerLocustRunner(LocustRunner):
             self.client.send_all(Message("exception", data, self.worker_id))
         events.locust_error += on_locust_error
 
-        self.greenlet.spawn(self.slave_listener).link_exception(callback=noop)
-        gevent.sleep(2)
+        gevent.sleep(0.1)
         self.client.send_all(Message("worker_ready", None, self.worker_id))
+        self.greenlet.spawn(self.slave_listener).link_exception(callback=noop)
         self.greenlet.spawn(self.stats_reporter).link_exception(callback=noop)
 
     def quit(self):
@@ -292,6 +279,7 @@ class WorkerLocustRunner(LocustRunner):
     def slave_listener(self):
         while True:
             self.client.recv()
+            gevent.sleep()
 
     def stats_reporter(self):
         while True:

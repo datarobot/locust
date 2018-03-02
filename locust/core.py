@@ -16,7 +16,7 @@ from .clients import HttpSession, SocketIOClient, ZMQClient
 from .exception import (InterruptTaskSet, LocustError, RescheduleTask,
                         RescheduleTaskImmediately, StopLocust)
 
-monkey.patch_all(thread=False)
+monkey.patch_all()
 logger = logging.getLogger(__name__)
 
 

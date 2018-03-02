@@ -1,7 +1,10 @@
 """Master Locust runner. Represent master for distributed worker sceduler process"""
-import logging
+import os
+import sys
 import time
-from multiprocessing import Process
+import pickle
+import logging
+import subprocess
 
 import gevent
 from gevent.pool import Group
@@ -87,6 +90,7 @@ class MasterLocustRunner(DistributedLocustRunner):
         @_validate_msg
         def on_pong(self, msg):
             self.master.slaves[msg.node_id].ping_answ = True
+            self.master.slaves[msg.node_id].ping_missed = 0
 
 
     def __init__(self, locust_classes, options):
@@ -143,12 +147,14 @@ class MasterLocustRunner(DistributedLocustRunner):
         return self.stats.errors
 
     def spawn_slave(self):
-        pid = Process(target=SlaveLocustRunner.spawn, args=(
-            self.locust_classes,
-            self.options,
-            self
-        ))
-        pid.start()
+        path = os.path.dirname(os.path.abspath(__file__)) + '/subrunner.py'
+        options = pickle.dumps(self.options)
+        command = "{} {} --process slave --options \"{}\"".format(
+            sys.executable, path, options
+        )
+        locusts = [sys.modules[lc.__module__].__file__ for lc in self.locust_classes]
+        command += ' ' + ' '.join(locusts)
+        subprocess.Popen([command], shell=True)
 
     def wait_for_slaves(self, n=0):
         counter = 0
@@ -187,9 +193,12 @@ class MasterLocustRunner(DistributedLocustRunner):
         while True:
             gen = (w for w in self.slaves.copy().itervalues() if not w.ping_answ)
             for dead_slave in gen:
-                self.server.send_to(dead_slave.id, Message("quit", None, None))
-                del self.slaves[dead_slave.id]
-                logger.warn("Connection to %s slave was lost", dead_slave.id)
+                if dead_slave.ping_missed > 3:
+                    self.server.send_to(dead_slave.id, Message("unknown", None, None))
+                    del self.slaves[dead_slave.id]
+                    logger.warn("Connection to %s slave was lost", dead_slave.id)
+                else:
+                    dead_slave.ping_missed += 1
 
             for slave in self.slaves.itervalues():
                 slave.ping_answ = False
@@ -199,6 +208,7 @@ class MasterLocustRunner(DistributedLocustRunner):
     def slaves_listener(self):
         while True:
             self.server.recv()
+            gevent.sleep()
 
     def start_hatching(self, locust_count, hatch_rate):
         worker_num = self.slave_count
