@@ -163,5 +163,18 @@ def clear_events_handlers():
     master_stop_hatching.clear()
     locust_start_hatching.clear()
     locust_stop_hatching.clear()
+
+def clear_events_handlers():
+    request_success.clear()
+    request_failure.clear()
+    locust_error.clear()
+    report_to_master.clear()
+    node_report.clear()
+    hatch_complete.clear()
+    quitting.clear()
+    master_start_hatching.clear()
+    master_stop_hatching.clear()
+    locust_start_hatching.clear()
+    locust_stop_hatching.clear()
     task_success.clear()
     task_failure.clear()

@@ -9,7 +9,7 @@ class Message(object):
 
     def serialize(self):
         return msgpack.dumps((self.type, self.data, self.node_id))
-
+    
     @classmethod
     def unserialize(cls, data):
         msg = cls(*msgpack.loads(data, encoding='utf-8'))

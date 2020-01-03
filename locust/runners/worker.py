@@ -27,6 +27,10 @@ class LocustRunner(object):
     def __init__(self, locust_classes, options):
         self.options = options
         self.locust_classes = locust_classes
+        self.hatch_rate = options.hatch_rate
+        self.num_clients = options.num_clients
+        self.num_requests = options.num_requests
+        self.host = options.host
         self.locusts = Group()
         self.state = STATE.INIT
         self.hatching_greenlet = None
@@ -40,11 +44,6 @@ class LocustRunner(object):
                 logger.info("Resetting stats\n")
                 self.stats.reset_all()
         events.hatch_complete += on_hatch_complete
-
-        def on_locust_error(locust_instance, exception, tb):
-            formatted_tb = "".join(traceback.format_tb(tb))
-            self.log_exception("local", str(exception), formatted_tb)
-        events.locust_error += on_locust_error
 
     @property
     def request_stats(self):
@@ -72,6 +71,8 @@ class LocustRunner(object):
                 )
                 continue
 
+            if self.host is not None:
+                locust.host = self.host
             if stop_timeout is not None:
                 locust.stop_timeout = stop_timeout
 
@@ -83,10 +84,10 @@ class LocustRunner(object):
 
     def spawn_locusts(self, spawn_count=None, stop_timeout=None, wait=False):
         if spawn_count is None:
-            spawn_count = self.options.num_clients
+            spawn_count = self.num_clients
 
-        if self.options.num_requests is not None:
-            self.stats.max_requests = self.options.num_requests
+        if self.num_requests is not None:
+            self.stats.max_requests = self.num_requests
 
         bucket = self.weight_locusts(spawn_count, stop_timeout)
         spawn_count = len(bucket)
@@ -116,12 +117,12 @@ class LocustRunner(object):
 
                 locust = bucket.pop(random.randint(0, len(bucket)-1))
                 occurence_count[locust.__name__] += 1
-                def start_locust(locust, options):
+                def start_locust(_):
                     try:
-                        locust(options).run()
+                        locust().run()
                     except GreenletExit:
                         pass
-                new_locust = self.locusts.spawn(start_locust, locust, self.options)
+                new_locust = self.locusts.spawn(start_locust, locust)
                 if len(self.locusts) % 10 == 0:
                     logger.debug("%i locusts hatched" % len(self.locusts))
                 gevent.sleep(sleep_time)
@@ -190,8 +191,10 @@ class LocustRunner(object):
 
     def log_exception(self, node_id, msg, formatted_tb):
         key = hash(formatted_tb)
-        row_body = {"count": 0, "msg": msg, "traceback": formatted_tb, "nodes": set()}
-        row = self.exceptions.setdefault(key, row_body)
+        row = self.exceptions.setdefault(
+            key,
+            {"count": 0, "msg": msg, "traceback": formatted_tb, "nodes": set()}
+        )
         row["count"] += 1
         row["nodes"].add(node_id)
         self.exceptions[key] = row
@@ -209,8 +212,9 @@ class WorkerLocustRunner(LocustRunner):
         def on_hatch(self, msg):
             self.worker.client.send_all(Message("hatching", None, self.worker.worker_id))
             job = msg.data
-            self.worker.hatch_rate = job["hatch_rate"]
-            self.worker.options.num_requests = job["num_requests"]
+            self.hatch_rate = job["hatch_rate"]
+            self.num_requests = job["num_requests"]
+            self.host = job["host"]
             self.hatching_greenlet = gevent.spawn(
                 lambda: self.worker.start_hatching(
                     locust_count=job["num_clients"],
@@ -218,17 +222,32 @@ class WorkerLocustRunner(LocustRunner):
                 )
             )
 
-        def on_new_config(self, msg):
-            self.worker.options.update_config(msg.data)
-
         def on_stop(self, msg):
-            events.quitting.fire()
+            self.worker.stop()
+            self.worker.client.send_all(Message("worker_stopped", None, self.worker.worker_id))
+            self.worker.client.send_all(Message("worker_ready", None, self.worker.worker_id))
 
         def on_quit(self, msg):
             events.quitting.fire()
 
         def on_ping(self, msg):
             self.worker.client.send_all(Message("pong", None, self.worker.worker_id))
+
+
+    @classmethod
+    def spawn(self, locust_classes, options, parent):
+        parent.server.close()
+        parent.client.close()
+        try:
+            parent.greenlet.kill(block=True)
+        except GreenletExit:
+            pass
+        gevent.reinit()
+        events.clear_events_handlers()
+        stats.subscribe_stats()
+        runner = WorkerLocustRunner(locust_classes, options)
+        runner.greenlet.join()
+        sys.exit(0)
 
     def __init__(self, locust_classes, options):
         super(WorkerLocustRunner, self).__init__(locust_classes, options)
@@ -266,20 +285,19 @@ class WorkerLocustRunner(LocustRunner):
             self.client.send_all(Message("exception", data, self.worker_id))
         events.locust_error += on_locust_error
 
-        gevent.sleep(0.1)
-        self.client.send_all(Message("worker_ready", None, self.worker_id))
         self.greenlet.spawn(self.slave_listener).link_exception(callback=noop)
+        gevent.sleep(0.5)
+        self.client.send_all(Message("worker_ready", None, self.worker_id))
         self.greenlet.spawn(self.stats_reporter).link_exception(callback=noop)
 
     def quit(self):
-        self.client.send_all(Message("quit", None, self.worker_id))
-        self.client.close()
+        self.client.send_all(Message("quit", None, None))
         self.greenlet.kill(block=True)
+        self.client.close()
 
     def slave_listener(self):
         while True:
             self.client.recv()
-            gevent.sleep()
 
     def stats_reporter(self):
         while True:

@@ -8,9 +8,15 @@ from collections import defaultdict
 from itertools import chain
 from time import time
 
+try:
+    # >= Py3.2
+    from html import escape
+except ImportError:
+    # < Py3.2
+    from cgi import escape
+
 import six
-from six.moves.urllib.parse import urlparse
-from flask import Flask, make_response, render_template, request
+from flask import Flask, make_response, jsonify, render_template, request
 from gevent import pywsgi
 
 from locust import __version__ as version
@@ -20,6 +26,11 @@ from . import runners
 from .cache import memoize
 # from .runners import MasterLocustRunner
 from .stats import distribution_csv, median_from_dict, requests_csv, sort_stats
+from .runners import MasterLocustRunner
+from .stats import failures_csv, median_from_dict, requests_csv, sort_stats, stats_history_csv
+from .util.cache import memoize
+from .util.rounding import proper_round
+from .util.timespan import parse_timespan
 
 
 logger = logging.getLogger(__name__)
@@ -33,13 +44,13 @@ app.root_path = os.path.dirname(os.path.abspath(__file__))
 
 @app.route('/')
 def index():
-    if runners.main.options.host:
-        host = runners.main.options.host
+    if runners.main.host:
+        host = runners.main.host
     elif len(runners.main.locust_classes) > 0:
         host = runners.main.locust_classes[0].host
     else:
         host = None
-
+    
     return render_template("index.html",
         state=runners.main.state,
         slave_count=runners.main.slave_count,
@@ -52,7 +63,7 @@ def index():
 @app.route('/swarm', methods=["POST"])
 def swarm():
     assert request.method == "POST"
-
+    is_step_load = runners.locust_runner.step_load
     locust_count = int(request.form["locust_count"])
     hatch_rate = float(request.form["hatch_rate"])
     runners.main.start_hatching(locust_count, hatch_rate)
@@ -71,38 +82,29 @@ def stop():
 def reset_stats():
     runners.main.stats.reset_all()
     return "ok"
-
-@app.route("/config", methods=["POST"])
-def propagate_config():
-    assert request.method == "POST"
-    url = urlparse(request.form["host_url"])
-    password = ":{}".format(url.password) if url.password else ''
-    userdata = "{}{}@".format(url.username, password) if (password or url.username) else ''
-    updates = {
-        'scheme': url.scheme or runners.main.options.scheme,
-        'host': "{}{}".format(userdata, url.hostname),
-        'port': url.port,
-    }
-    runners.main.propagate_config(updates=updates)
-    response = make_response(json.dumps({'success': True, 'new_host': runners.main.options.host}))
-    response.headers["Content-type"] = "application/json"
-    return response
-
+    
 @app.route("/stats/requests/csv")
 def request_stats_csv():
     response = make_response(requests_csv())
-
     file_name = "requests_{0}.csv".format(time())
     disposition = "attachment;filename={0}".format(file_name)
     response.headers["Content-type"] = "text/csv"
     response.headers["Content-disposition"] = disposition
     return response
 
-@app.route("/stats/distribution/csv")
-def distribution_stats_csv():
+@app.route("/stats/stats_history/csv")
+def stats_history_stats_csv():
+    response = make_response(stats_history_csv(False, True))
+    file_name = "stats_history_{0}.csv".format(time())
+    disposition = "attachment;filename={0}".format(file_name)
+    response.headers["Content-type"] = "text/csv"
+    response.headers["Content-disposition"] = disposition
+    return response
 
-    response = make_response(distribution_csv())
-    file_name = "distribution_{0}.csv".format(time())
+@app.route("/stats/failures/csv")
+def failures_stats_csv():
+    response = make_response(failures_csv())
+    file_name = "failures_{0}.csv".format(time())
     disposition = "attachment;filename={0}".format(file_name)
     response.headers["Content-type"] = "text/csv"
     response.headers["Content-disposition"] = disposition
@@ -114,16 +116,18 @@ def request_stats():
     stats = []
     for s in chain(sort_stats(runners.main.request_stats), [runners.main.stats.aggregated_stats("Total")]):
         stats.append({
-            "task": s.task,
             "method": s.method,
             "name": s.name,
+            "safe_name": escape(s.name, quote=False),
             "num_requests": s.num_requests,
             "num_failures": s.num_failures,
             "avg_response_time": s.avg_response_time,
-            "min_response_time": s.min_response_time or 0,
-            "max_response_time": s.max_response_time,
+            "min_response_time": 0 if s.min_response_time is None else proper_round(s.min_response_time),
+            "max_response_time": proper_round(s.max_response_time),
             "current_rps": s.current_rps,
+            "current_fail_per_sec": s.current_fail_per_sec,
             "median_response_time": s.median_response_time,
+            "ninetieth_response_time": s.get_response_time_percentile(0.9),
             "avg_content_length": s.avg_content_length,
         })
 
@@ -132,6 +136,8 @@ def request_stats():
     # Truncate the total number of stats and errors displayed since a large number of rows will cause the app
     # to render extremely slowly. Aggregate stats should be preserved.
     report = {"stats": stats[:500], "errors": errors[:500]}
+    if len(stats) > 500:
+        report["stats"] += [stats[-1]]
 
     if stats:
         report["total_rps"] = stats[len(stats)-1]["current_rps"]
@@ -148,21 +154,6 @@ def request_stats():
         # calculate total median
         stats[len(stats)-1]["median_response_time"] = median_from_dict(stats[len(stats)-1]["num_requests"], response_times)
 
-    task_stats = []
-    for t in chain(sort_stats(runners.main.task_stats), [runners.main.stats.aggregated_task_stats("Total")]):
-        task_stats.append({
-            "task": t.task,
-            "num_success": t.num_success,
-            "num_failures": t.num_failures,
-            "avg_execution_time": t.avg_execution_time,
-            "max_execution_time": t.max_execution_time,
-            "min_execution_time": t.min_execution_time
-        })
-    
-    tasks_failures = [f.to_dict() for f in six.itervalues(runners.main.stats.tasks_failures)]
-    report["taskStats"] = task_stats
-    report["tasksFailures"] = tasks_failures
-
     report["slave_count"] = runners.main.slave_count
 
     report["state"] = runners.main.state
@@ -173,25 +164,23 @@ def request_stats():
 
 @app.route("/exceptions")
 def exceptions():
-    response = make_response(json.dumps({
+    return jsonify({
         'exceptions': [
             {
                 "count": row["count"],
                 "msg": row["msg"],
                 "traceback": row["traceback"],
                 "nodes" : ", ".join(row["nodes"])
-            } for row in six.itervalues(runners.main.exceptions)
+            } for row in six.itervalues(runners.locust_runner.exceptions)
         ]
-    }))
-    response.headers["Content-type"] = "application/json"
-    return response
+    })
 
 @app.route("/exceptions/csv")
 def exceptions_csv():
     data = StringIO()
     writer = csv.writer(data)
     writer.writerow(["Count", "Message", "Traceback", "Nodes"])
-    for exc in six.itervalues(runners.main.exceptions):
+    for exc in six.itervalues(runners.locust_runner.exceptions):
         nodes = ", ".join(exc["nodes"])
         writer.writerow([exc["count"], exc["msg"], exc["traceback"], nodes])
 

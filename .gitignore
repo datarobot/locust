@@ -15,3 +15,5 @@ build/
 .tox/
 .vscode/
 **/.DS_Store
+.vscode/
+**/.DS_Store

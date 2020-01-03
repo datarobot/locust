@@ -10,7 +10,7 @@ from urlparse import urlparse
 from .core import Locust
 from .log import setup_logging
 
-__all__ = ['configure', 'locust_config', 'process_options', 'register_config']
+__all__ = ['configure', 'locust_config', 'process_options']
 
 logger = logging.getLogger(__name__)
 
@@ -19,28 +19,18 @@ class LocustConfig(object):
 
     LOGGER_MAP = {
         'locust_logging': 'locust',
-        'zmq_logging': 'locust.clients.zmq_client',
-        'socketio_logging': 'locust.clients.socketio',
+        'zmq_logging': 'locust.clients.zmq',
+        'websocket_logging': 'locust.clients.websocket',
         'http_logging': 'locust.clients.http',
     }
-
-    STATIC_PARAMS = [
-        'web_host',
-        'web_port',
-        'no_web',
-        'master_host',
-        'master_port',
-        'master_bind_host',
-        'master_bind_port',
-    ]
 
     DEFAULT = {
         # Endpoints
         'host': None,
         'scheme': 'http',
         'port': None,
-        'socket_io_resource': 'socket.io',
-        'socket_io_service': '',
+        'socket_resource': 'socket.io-queue',
+        'websocket_service': '',
 
         # Execution related config
         'min_wait': 1,
@@ -63,9 +53,9 @@ class LocustConfig(object):
 
         # Logging
         'http_logging': 'ERROR',
-        'socketio_logging': 'ERROR',
+        'websocket_logging': 'ERROR',
         'zmq_logging': 'ERROR',
-        'locust_logging': 'WARN',
+        'locust_logging': 'ERROR',
         'logfile': None
     }
 
@@ -81,21 +71,9 @@ class LocustConfig(object):
     def _validate(self):
         """Validate settings"""
         if not self._config['host']:
-            logger.error(
-                "No target host were provided." +\
-                "Please provide target host via cli or setup contextmanager"
-            )
+            logger.error("No target host were provided. Please provide target host via cli or setup contextmanager")
             sys.exit(1)
-
-    def to_dict(self):
-        """Return config object as raw dict"""
-        return self._config.copy()
-
-    def update_config(self, config_dict):
-        """Update config object with raw dict"""
-        for k, v in config_dict.items():
-            if k not in self.STATIC_PARAMS:
-                self._config[k] = v
+        # if 
 
     @property
     def host(self):
@@ -104,7 +82,7 @@ class LocustConfig(object):
         return '{}://{}{}'.format(config['scheme'], config['host'], port)
 
     @property
-    def socket_io(self):
+    def web_socket(self):
         return self.host
 
     def __getattr__(self, attr):
@@ -116,40 +94,21 @@ class LocustConfig(object):
         else:
             self._config[attr] = value
 
-    def __getstate__(self):
-        return self.__dict__
-    
-    def __setstate__(self, d):
-        self.__dict__.update(d)
-
 # global locust config singleton
-_locust_config = LocustConfig()
-
-def locust_config():
-    return _locust_config
-
-def register_config(config):
-    global _locust_config
-    """
-    Update default locust configuration object with custom instance
-    config argument should be instance of LocustConfig or inherited class
-    """
-    if not isinstance(config, LocustConfig):
-        raise AttributeError('Config object sgould be instance of LocustConfig')
-    _locust_config = config
+locust_config = LocustConfig()
 
 @contextmanager
 def configure():
     """locust configuration context manager"""
-    yield _locust_config
+    yield locust_config
 
 def process_options():
-    _parser, opts, args = parse_options()
+    parser, opts, args = parse_options()
     setup_logging(opts.loglevel, opts.logfile)
     with configure() as config:
         loglevel = opts.__dict__.pop('loglevel')
         config.http_logging = loglevel
-        config.socketio_logging = loglevel
+        config.websocket_logging = loglevel
         config.zmq_logging = loglevel
         config.locust_logging = loglevel
         host = opts.__dict__.pop('host')
@@ -162,10 +121,10 @@ def process_options():
             setattr(config, attr, value)
 
     locusts = load_locusts(opts, args)
-    _locust_config._apply()
-    _locust_config._validate()
+    locust_config._apply()
+    locust_config._validate()
 
-    return _locust_config, locusts
+    return locust_config, locusts
 
 def parse_options():
     """
@@ -320,16 +279,6 @@ def parse_options():
         help="Path to log file. If not set, log will go to stdout/stderr",
     )
 
-    # A file that contains the current request stats.
-    parser.add_option(
-        '--csv', '--csv-base-name',
-        action='store',
-        type='str',
-        dest='csvfilebase',
-        default=None,
-        help="Store current request stats to files in CSV format.",
-    )
-
     # List locust commands found in loaded locust files/source files
     parser.add_option(
         '-l', '--list',
@@ -347,7 +296,6 @@ def parse_options():
         default=False,
         help="print table of the locust classes' task execution ratio"
     )
-
     # Display ratio table of all tasks in JSON format
     parser.add_option(
         '--show-task-ratio-json',
@@ -355,15 +303,6 @@ def parse_options():
         dest='show_task_ratio_json',
         default=False,
         help="print json data of the locust classes' task execution ratio"
-    )
-
-    # Display ratio table of all tasks in JSON format
-    parser.add_option(
-        '--print-stats',
-        action='store_true',
-        dest='print_stats',
-        default=False,
-        help="print testrun statistics to console"
     )
 
     # Version number (optparse gives you --version but we have to do it

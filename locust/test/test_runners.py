@@ -6,632 +6,605 @@ from gevent.queue import Queue
 
 import mock
 from locust import events
-from locust.core import Locust, WebLocust, TaskSet, task
+from locust.core import Locust, TaskSet, task
 from locust.exception import LocustError
-from locust import config
 from locust.rpc import Message
-from locust import runners
-from locust.runners import MasterLocustRunner, SlaveLocustRunner, WorkerLocustRunner
-from locust.runners.worker import LocustRunner
-from locust.stats import global_stats
+from locust.runners import LocustRunner, LocalLocustRunner, MasterLocustRunner, SlaveNode, \
+     SlaveLocustRunner, STATE_INIT, STATE_HATCHING, STATE_RUNNING, STATE_MISSING
+from locust.stats import global_stats, RequestStats
 from locust.test.testcases import LocustTestCase
+from locust.wait_time import between, constant
 
 
-def mocked_rpc_server():
-    class MockedRpcServer(object):
+def mocked_rpc():
+    class MockedRpcServerClient(object):
         queue = Queue()
-        outbox_all = []
-        outbox_direct = []
+        outbox = []
 
-        def __init__(self, *args):
+        def __init__(self, *args, **kwargs):
             pass
-
+        
         @classmethod
-        def mocked_send(cls, to, message):
-            cls.queue.put(to + ' ' + message.serialize())
+        def mocked_send(cls, message):
+            cls.queue.put(message.serialize())
+            sleep(0)
 
         def recv(self):
-            data = self.queue.get()
-            msg = Message.unserialize(data.split(' ', 1)[1])
-            getattr(self.handler, 'on_' + msg.type)(msg)
+            results = self.queue.get()
+            return Message.unserialize(results)
+        
+        def send(self, message):
+            self.outbox.append(message)
+    
+        def send_to_client(self, message):
+            self.outbox.append((message.node_id, message))
 
-        def send_all(self, message):
-            self.outbox_all.append(message.serialize())
+        def recv_from_client(self):
+            results = self.queue.get()
+            msg = Message.unserialize(results)
+            return msg.node_id, msg
 
-        def send_to(self, id, message):
-            self.outbox_direct.append((id, message.serialize()))
-
-        def bind_handler(self, handler):
-            self.handler = handler
-
-        def close(self):
-            pass
-
-    return MockedRpcServer
-
-def mocked_process():
-    class MockedProcess(object):
-        started = []
-
-        def __init__(self, *args, **target):
-            pass
-
-        def start(self):
-            self.started.append('pid')
-
-    return MockedProcess
+    return MockedRpcServerClient
 
 
-class TestMasterDefaultSlave(LocustTestCase):
+class mocked_options(object):
+    def __init__(self):
+        self.hatch_rate = 5
+        self.num_clients = 5
+        self.host = '/'
+        self.master_host = 'localhost'
+        self.master_port = 5557
+        self.master_bind_host = '*'
+        self.master_bind_port = 5557
+        self.heartbeat_liveness = 3
+        self.heartbeat_interval = 1
+        self.stop_timeout = None
+        self.step_load = True
 
-    def tearDown(self):
-        self.master.quit()
+    def reset_stats(self):
+        pass
 
-    def test_default_slave_up(self):
-        class MyTestLocust(WebLocust):
-            pass
 
-        self.master = MasterLocustRunner(MyTestLocust, config.locust_config())
-        self.assertEqual(self.master.slave_count, 1)
+class TestLocustRunner(LocustTestCase):
+    def assert_locust_class_distribution(self, expected_distribution, classes):
+        # Construct a {LocustClass => count} dict from a list of locust classes
+        distribution = {}
+        for locust_class in classes:
+            if not locust_class in distribution:
+                distribution[locust_class] = 0
+            distribution[locust_class] += 1
+        expected_str = str({k.__name__:v for k,v in expected_distribution.items()})
+        actual_str = str({k.__name__:v for k,v in distribution.items()})
+        self.assertEqual(
+            expected_distribution,
+            distribution,
+            "Expected a locust class distribution of %s but found %s" % (
+                expected_str,
+                actual_str,
+            ),
+        )
+
+    def test_weight_locusts(self):
+        maxDiff = 2048
+        class BaseLocust(Locust):
+            class task_set(TaskSet): pass
+        class L1(BaseLocust):
+            weight = 101
+        class L2(BaseLocust):
+            weight = 99
+        class L3(BaseLocust):
+            weight = 100
+
+        runner = LocustRunner([L1, L2, L3], mocked_options())
+        self.assert_locust_class_distribution({L1:10, L2:9, L3:10}, runner.weight_locusts(29))
+        self.assert_locust_class_distribution({L1:10, L2:10, L3:10}, runner.weight_locusts(30))
+        self.assert_locust_class_distribution({L1:11, L2:10, L3:10}, runner.weight_locusts(31))
+
+    def test_weight_locusts_fewer_amount_than_locust_classes(self):
+        class BaseLocust(Locust):
+            class task_set(TaskSet): pass
+        class L1(BaseLocust):
+            weight = 101
+        class L2(BaseLocust):
+            weight = 99
+        class L3(BaseLocust):
+            weight = 100
+
+        runner = LocustRunner([L1, L2, L3], mocked_options())
+        self.assertEqual(1, len(runner.weight_locusts(1)))
+        self.assert_locust_class_distribution({L1:1},  runner.weight_locusts(1))
+
+    def test_kill_locusts(self):
+        triggered = [False]
+        class BaseLocust(Locust):
+            wait_time = constant(1)
+            class task_set(TaskSet):
+                @task
+                def trigger(self):
+                    triggered[0] = True
+        runner = LocustRunner([BaseLocust], mocked_options())
+        runner.spawn_locusts(2, wait=False)
+        self.assertEqual(2, len(runner.locusts))
+        g1 = list(runner.locusts)[0]
+        g2 = list(runner.locusts)[1]
+        runner.kill_locusts(2)
+        self.assertEqual(0, len(runner.locusts))
+        self.assertTrue(g1.dead)
+        self.assertTrue(g2.dead)
+        self.assertTrue(triggered[0])
+
 
 
 class TestMasterRunner(LocustTestCase):
     def setUp(self):
+        super(TestMasterRunner, self).setUp()
         global_stats.reset_all()
         self._slave_report_event_handlers = [h for h in events.node_report._handlers]
 
+        parser, _, _ = parse_options()
+        args = [
+            "--clients", "10",
+            "--hatch-rate", "10"
+        ]
+        opts, _ = parser.parse_args(args)
+        self.options = opts
+        
     def tearDown(self):
-        events.node_report._handlers = self._slave_report_event_handlers
-        self.master.quit()
-
+        events.slave_report._handlers = self._slave_report_event_handlers
+        super(TestMasterRunner, self).tearDown()
+    
     def test_slave_connect(self):
-        import mock
-
         class MyTestLocust(Locust):
             pass
-
-        with mock.patch("locust.rpc.rpc.MasterServer", mocked_rpc_server()) as server:
-            with mock.patch("locust.runners.master.Process", mocked_process()):
-                server.mocked_send('all', Message("slave_ready", None, "zeh_fake_client1"))
-                self.master = MasterLocustRunner(MyTestLocust, config.locust_config())
-                sleep(0)
-                self.assertEqual(1, self.master.slave_count)
-                self.assertTrue(
-                    "zeh_fake_client1" in self.master.slaves,
-                    "Could not find fake client in master instance's clients dict"
-                )
-                server.mocked_send("all", Message("slave_ready", None, "zeh_fake_client2"))
-                server.mocked_send("all", Message("slave_ready", None, "zeh_fake_client3"))
-                server.mocked_send("all", Message("slave_ready", None, "zeh_fake_client4"))
-                sleep(0)
-                self.assertEqual(4, self.master.slave_count)
-
-                server.mocked_send("all", Message("quit", None, "zeh_fake_client3"))
-                sleep(0)
-                self.assertEqual(3, self.master.slave_count)
-
-    def test_automatic_options_propagate(self):
-        import mock
-
-        class MyTestLocust(Locust):
-            pass
-
-        with mock.patch("locust.rpc.rpc.MasterServer", mocked_rpc_server()) as server:
-            with mock.patch("locust.runners.master.Process", mocked_process()):
-                server.mocked_send('all', Message("slave_ready", None, "zeh_fake_client1"))
-                self.master = MasterLocustRunner(MyTestLocust, config.locust_config())
-                sleep(0)
-                self.assertEqual(1, self.master.slave_count)
-                self.assertEqual(1, len(server.outbox_direct))
-                msg = Message.unserialize(server.outbox_direct[0][1]).data
-                self.assertEqual(self.master.options._config, msg)
-
-    def test_unknown_response_for_unkown_slave(self):
-        import mock
-
-        class MyTestLocust(Locust):
-            pass
-
-        with mock.patch("locust.rpc.rpc.MasterServer", mocked_rpc_server()) as server:
-            with mock.patch("locust.runners.master.Process", mocked_process()):
-                server.mocked_send('all', Message("slave_ready", None, "zeh_fake_client1"))
-                self.master = MasterLocustRunner(MyTestLocust, config.locust_config())
-                sleep(0)
-                server.outbox_direct = []
-                server.mocked_send('all', Message("stats", None, "zeh_fake_client2"))
-                sleep(0)
-                self.assertEqual(1, self.master.slave_count)
-                self.assertEqual(1, len(server.outbox_direct))
-                msg = Message.unserialize(server.outbox_direct[0][1]).type
-                self.assertEqual(msg, 'unknown')
-
-    def test_on_demand_options_propagate(self):
-        import mock
-
-        class MyTestLocust(Locust):
-            pass
-
-        with mock.patch("locust.rpc.rpc.MasterServer", mocked_rpc_server()) as server:
-            with mock.patch("locust.runners.master.Process", mocked_process()):
-                server.mocked_send('all', Message("slave_ready", None, "zeh_fake_client1"))
-                self.master = MasterLocustRunner(MyTestLocust, config.locust_config())
-                sleep(0)
-                self.assertEqual(1, self.master.slave_count)
-                server.outbox_all = []
-                config_upd = {'host': 'custom_host.com', 'master_host': 'new_master_host.com'}
-                self.master.propagate_config(config_upd)
-                self.assertEqual(1, len(server.outbox_all))
-
-                msg = Message.unserialize(server.outbox_all[0]).data
-                self.assertEqual(msg['host'], 'custom_host.com')
-                self.assertEqual(msg['master_host'], '127.0.0.1')
-
+        
+        with mock.patch("locust.rpc.rpc.Server", mocked_rpc()) as server:
+            master = MasterLocustRunner(MyTestLocust, self.options)
+            server.mocked_send(Message("client_ready", None, "zeh_fake_client1"))
+            self.assertEqual(1, len(master.clients))
+            self.assertTrue("zeh_fake_client1" in master.clients, "Could not find fake client in master instance's clients dict")
+            server.mocked_send(Message("client_ready", None, "zeh_fake_client2"))
+            server.mocked_send(Message("client_ready", None, "zeh_fake_client3"))
+            server.mocked_send(Message("client_ready", None, "zeh_fake_client4"))
+            self.assertEqual(4, len(master.clients))
+            
+            server.mocked_send(Message("quit", None, "zeh_fake_client3"))
+            self.assertEqual(3, len(master.clients))
+    
     def test_slave_stats_report_median(self):
-        import mock
+        class MyTestLocust(Locust):
+            pass
+        
+        with mock.patch("locust.rpc.rpc.Server", mocked_rpc()) as server:
+            master = MasterLocustRunner(MyTestLocust, self.options)
+            server.mocked_send(Message("client_ready", None, "fake_client"))
+            
+            master.stats.get("/", "GET").log(100, 23455)
+            master.stats.get("/", "GET").log(800, 23455)
+            master.stats.get("/", "GET").log(700, 23455)
+            
+            data = {"user_count":1}
+            events.report_to_master.fire(client_id="fake_client", data=data)
+            master.stats.clear_all()
+            
+            server.mocked_send(Message("stats", data, "fake_client"))
+            s = master.stats.get("/", "GET")
+            self.assertEqual(700, s.median_response_time)
 
+    def test_slave_stats_report_with_none_response_times(self):
         class MyTestLocust(Locust):
             pass
 
-        with mock.patch("locust.rpc.rpc.MasterServer", mocked_rpc_server()) as server:
-            with mock.patch("locust.runners.master.Process", mocked_process()):
-                server.mocked_send('all', Message("slave_ready", None, "fake_client"))
-                self.master = MasterLocustRunner(MyTestLocust, config.locust_config())
-                sleep(0)
+        with mock.patch("locust.rpc.rpc.Server", mocked_rpc()) as server:
+            master = MasterLocustRunner(MyTestLocust, self.options)
+            server.mocked_send(Message("client_ready", None, "fake_client"))
 
-                self.master.stats.get("Task", "/", "GET").log(100, 23455)
-                self.master.stats.get("Task", "/", "GET").log(800, 23455)
-                self.master.stats.get("Task", "/", "GET").log(700, 23455)
+            master.stats.get("/mixed", "GET").log(0, 23455)
+            master.stats.get("/mixed", "GET").log(800, 23455)
+            master.stats.get("/mixed", "GET").log(700, 23455)
+            master.stats.get("/mixed", "GET").log(None, 23455)
+            master.stats.get("/mixed", "GET").log(None, 23455)
+            master.stats.get("/mixed", "GET").log(None, 23455)
+            master.stats.get("/mixed", "GET").log(None, 23455)
+            master.stats.get("/onlyNone", "GET").log(None, 23455)
 
-                data = {"user_count": 1, "worker_count": 1}
-                events.report_to_master.fire(node_id="fake_client", data=data)
-                self.master.stats.clear_all()
+            data = {"user_count":1}
+            events.report_to_master.fire(client_id="fake_client", data=data)
+            master.stats.clear_all()
 
-                server.mocked_send("all", Message("stats", data, "fake_client"))
-                sleep(0)
-                s = self.master.stats.get("Task", "/", "GET")
-                self.assertEqual(700, s.median_response_time)
+            server.mocked_send(Message("stats", data, "fake_client"))
+            s1 = master.stats.get("/mixed", "GET")
+            self.assertEqual(700, s1.median_response_time)
+            self.assertEqual(500, s1.avg_response_time)
+            s2 = master.stats.get("/onlyNone", "GET")
+            self.assertEqual(0, s2.median_response_time)
+            self.assertEqual(0, s2.avg_response_time)
 
-    def test_spawn_uneven_locusts(self):
-        """
-        Tests that we can accurately spawn a certain number of locusts, even if it's not an
-        even number of the connected slaves
-        """
-        import mock
-
+    def test_master_marks_downed_slaves_as_missing(self):
         class MyTestLocust(Locust):
             pass
 
-        with mock.patch("locust.rpc.rpc.MasterServer", mocked_rpc_server()) as server:
-            with mock.patch("locust.runners.master.Process", mocked_process()):
-                server.mocked_send('all', Message("slave_ready", None, "fake_client0"))
-                self.master = MasterLocustRunner(MyTestLocust, config.locust_config())
-                for i in range(1, 5):
-                    server.mocked_send("all", Message("slave_ready", None, "fake_client%i" % i))
-                    sleep(0)
+        with mock.patch("locust.rpc.rpc.Server", mocked_rpc()) as server:
+            master = MasterLocustRunner(MyTestLocust, self.options)
+            server.mocked_send(Message("client_ready", None, "fake_client"))
+            sleep(6)
+            # print(master.clients['fake_client'].__dict__)
+            assert master.clients['fake_client'].state == STATE_MISSING
 
-                server.outbox_direct = []
-                self.master.start_hatching(7, 7)
-                self.assertEqual(5, len(server.outbox_direct))
-
-                num_clients = 0
-                for msg in server.outbox_direct:
-                    num_clients += Message.unserialize(msg[1]).data["num_clients"]
-                self.assertEqual(
-                    7,
-                    num_clients,
-                    "Total number of locusts that would have been spawned is not 7"
-                )
-
-    def test_spawn_fewer_locusts_than_slaves(self):
-        import mock
-
+    def test_master_total_stats(self):
         class MyTestLocust(Locust):
             pass
 
-        with mock.patch("locust.rpc.rpc.MasterServer", mocked_rpc_server()) as server:
-            with mock.patch("locust.runners.master.Process", mocked_process()):
-                server.mocked_send('all', Message("slave_ready", None, "fake_client0"))
-                self.master = MasterLocustRunner(MyTestLocust, config.locust_config())
-                for i in range(1, 5):
-                    server.mocked_send('all', Message("slave_ready", None, "fake_client%i" % i))
-                    sleep(0)
+        with mock.patch("locust.rpc.rpc.Server", mocked_rpc()) as server:
+            master = MasterLocustRunner(MyTestLocust, self.options)
+            server.mocked_send(Message("client_ready", None, "fake_client"))
+            stats = RequestStats()
+            stats.log_request("GET", "/1", 100, 3546)
+            stats.log_request("GET", "/1", 800, 56743)
+            stats2 = RequestStats()
+            stats2.log_request("GET", "/2", 700, 2201)
+            server.mocked_send(Message("stats", {
+                "stats":stats.serialize_stats(),
+                "stats_total": stats.total.serialize(),
+                "errors":stats.serialize_errors(),
+                "user_count": 1,
+            }, "fake_client"))
+            server.mocked_send(Message("stats", {
+                "stats":stats2.serialize_stats(),
+                "stats_total": stats2.total.serialize(),
+                "errors":stats2.serialize_errors(),
+                "user_count": 2,
+            }, "fake_client"))
+            self.assertEqual(700, master.stats.total.median_response_time)
 
-                server.outbox_direct = []
-                self.master.start_hatching(2, 2)
-                self.assertEqual(5, len(server.outbox_direct))
-
-                num_clients = 0
-                for msg in server.outbox_direct:
-                    num_clients += Message.unserialize(msg[1]).data["num_clients"]
-
-                self.assertEqual(
-                    2,
-                    num_clients,
-                    "Total number of locusts that would have been spawned is not 2"
-                )
-
-    def test_heartbeat(self):
-        import mock
-
+    def test_master_total_stats_with_none_response_times(self):
         class MyTestLocust(Locust):
             pass
 
-        with mock.patch("locust.rpc.rpc.MasterServer", mocked_rpc_server()) as server:
-            with mock.patch("locust.runners.master.Process", mocked_process()):
-                server.mocked_send('all', Message("slave_ready", None, "fake_client0"))
-                self.master = MasterLocustRunner(MyTestLocust, config.locust_config())
+        with mock.patch("locust.rpc.rpc.Server", mocked_rpc()) as server:
+            master = MasterLocustRunner(MyTestLocust, self.options)
+            server.mocked_send(Message("client_ready", None, "fake_client"))
+            stats = RequestStats()
+            stats.log_request("GET", "/1", 100, 3546)
+            stats.log_request("GET", "/1", 800, 56743)
+            stats.log_request("GET", "/1", None, 56743)
+            stats2 = RequestStats()
+            stats2.log_request("GET", "/2", 700, 2201)
+            stats2.log_request("GET", "/2", None, 2201)
+            stats3 = RequestStats()
+            stats3.log_request("GET", "/3", None, 2201)
+            server.mocked_send(Message("stats", {
+                "stats":stats.serialize_stats(),
+                "stats_total": stats.total.serialize(),
+                "errors":stats.serialize_errors(),
+                "user_count": 1,
+            }, "fake_client"))
+            server.mocked_send(Message("stats", {
+                "stats":stats2.serialize_stats(),
+                "stats_total": stats2.total.serialize(),
+                "errors":stats2.serialize_errors(),
+                "user_count": 2,
+            }, "fake_client"))
+            server.mocked_send(Message("stats", {
+                "stats":stats3.serialize_stats(),
+                "stats_total": stats3.total.serialize(),
+                "errors":stats3.serialize_errors(),
+                "user_count": 2,
+            }, "fake_client"))
+            self.assertEqual(700, master.stats.total.median_response_time)
 
-                sleep(0)
-                self.assertEqual(1, len(server.outbox_all))
-                self.assertEqual('ping', Message.unserialize(server.outbox_all[0]).type)
-                server.mocked_send('all', Message("pong", None, "fake_client0"))
-                sleep(runners.master.HEARTBEAT_INTERVAL)
-                self.assertEqual(1, self.master.slave_count)
-                sleep(runners.master.HEARTBEAT_INTERVAL)
-                self.assertEqual(0, self.master.slave_count)
-
-
-class TestSlaveRunner(LocustTestCase):
-
-    def setUp(self):
-        global_stats.reset_all()
-        self._slave_report_event_handlers = [h for h in events.node_report._handlers]
-
-    def tearDown(self):
-        events.node_report._handlers = self._slave_report_event_handlers
-        self.slave.quit()
-
-    def test_worker_connect(self):
-        import mock
-
+    def test_master_current_response_times(self):
         class MyTestLocust(Locust):
             pass
 
-        with mock.patch("locust.rpc.rpc.SlaveServer", mocked_rpc_server()) as server:
-            with mock.patch("locust.runners.slave.Process", mocked_process()):
-                self.slave = SlaveLocustRunner(MyTestLocust, config.locust_config())
-                server.mocked_send('all', Message("worker_ready", None, "zeh_fake_client1"))
-                sleep(0)
-                self.slave.start_hatching(1, 1)
-                self.assertEqual(1, self.slave.worker_count)
-                self.assertTrue(
-                    "zeh_fake_client1" in self.slave.workers,
-                    "Could not find fake client in master instance's clients dict"
-                )
-                server.mocked_send("all", Message("worker_ready", None, "zeh_fake_client2"))
-                server.mocked_send("all", Message("worker_ready", None, "zeh_fake_client3"))
-                server.mocked_send("all", Message("worker_ready", None, "zeh_fake_client4"))
-                sleep(0)
-                self.assertEqual(4, self.slave.worker_count)
+        start_time = 1
+        with mock.patch("time.time") as mocked_time:
+            mocked_time.return_value = start_time
+            global_stats.reset_all()
+            with mock.patch("locust.rpc.rpc.Server", mocked_rpc()) as server:
+                master = MasterLocustRunner(MyTestLocust, self.options)
+                mocked_time.return_value += 1.0234
+                server.mocked_send(Message("client_ready", None, "fake_client"))
+                stats = RequestStats()
+                stats.log_request("GET", "/1", 100, 3546)
+                stats.log_request("GET", "/1", 800, 56743)
+                server.mocked_send(Message("stats", {
+                    "stats":stats.serialize_stats(),
+                    "stats_total": stats.total.get_stripped_report(),
+                    "errors":stats.serialize_errors(),
+                    "user_count": 1,
+                }, "fake_client"))
+                mocked_time.return_value += 1
+                stats2 = RequestStats()
+                stats2.log_request("GET", "/2", 400, 2201)
+                server.mocked_send(Message("stats", {
+                    "stats":stats2.serialize_stats(),
+                    "stats_total": stats2.total.get_stripped_report(),
+                    "errors":stats2.serialize_errors(),
+                    "user_count": 2,
+                }, "fake_client"))
+                mocked_time.return_value += 4
+                self.assertEqual(400, master.stats.total.get_current_response_time_percentile(0.5))
+                self.assertEqual(800, master.stats.total.get_current_response_time_percentile(0.95))
 
-                server.mocked_send("all", Message("quit", None, "zeh_fake_client3"))
-                sleep(0)
-                self.assertEqual(3, self.slave.worker_count)
+                # let 10 second pass, do some more requests, send it to the master and make
+                # sure the current response time percentiles only accounts for these new requests
+                mocked_time.return_value += 10.10023
+                stats.log_request("GET", "/1", 20, 1)
+                stats.log_request("GET", "/1", 30, 1)
+                stats.log_request("GET", "/1", 3000, 1)
+                server.mocked_send(Message("stats", {
+                    "stats":stats.serialize_stats(),
+                    "stats_total": stats.total.get_stripped_report(),
+                    "errors":stats.serialize_errors(),
+                    "user_count": 2,
+                }, "fake_client"))
+                self.assertEqual(30, master.stats.total.get_current_response_time_percentile(0.5))
+                self.assertEqual(3000, master.stats.total.get_current_response_time_percentile(0.95))
 
-    def test_worker_receive_propagated_config(self):
-        import mock
-
+    def test_sends_hatch_data_to_ready_running_hatching_slaves(self):
+        '''Sends hatch job to running, ready, or hatching slaves'''
         class MyTestLocust(Locust):
             pass
 
-        with mock.patch("locust.rpc.rpc.SlaveClient", mocked_rpc_server()) as client:
-            with mock.patch("locust.runners.slave.Process", mocked_process()) as processes:
-                self.slave = SlaveLocustRunner(MyTestLocust, config.locust_config())
-                sleep(0)
-                self.assertEqual(2, len(client.outbox_all))
-                msg = {'host': 'custom_host.com', 'master_host': 'new_master_host.com'}
-                client.mocked_send('all', Message("new_config", msg, "master"))
-                sleep(0)
-                self.assertEqual(self.slave.options.host, 'http://custom_host.com')
-                self.assertEqual(self.slave.options.master_host, '127.0.0.1')
+        with mock.patch("locust.rpc.rpc.Server", mocked_rpc()) as server:
+            master = MasterLocustRunner(MyTestLocust, self.options)
+            master.clients[1] = SlaveNode(1)
+            master.clients[2] = SlaveNode(2)
+            master.clients[3] = SlaveNode(3)
+            master.clients[1].state = STATE_INIT
+            master.clients[2].state = STATE_HATCHING
+            master.clients[3].state = STATE_RUNNING
+            master.start_hatching(5,5)
 
-    def test_slave_receive_unknown(self):
-        import mock
+            self.assertEqual(3, len(server.outbox))
 
-        class MyTestLocust(Locust):
-            pass
-
-        with mock.patch("locust.rpc.rpc.SlaveServer", mocked_rpc_server()) as server:
-            with mock.patch("locust.rpc.rpc.SlaveClient", mocked_rpc_server()) as client:
-                with mock.patch("locust.runners.slave.Process", mocked_process()) as processes:
-                    self.slave = SlaveLocustRunner(MyTestLocust, config.locust_config())
-                    client.mocked_send('all', Message("unknown", None, "master"))
-                    sleep(0)
-                    msgs = [Message.unserialize(msg).type for msg in client.outbox_all]
-                    ready_count = filter(lambda x: x == 'slave_ready', msgs)
-                    self.assertEqual(len(ready_count), 2)
-
-    def test_slave_respond_quit_for_unknown_worker(self):
-        import mock
-
-        class MyTestLocust(Locust):
-            pass
-
-        with mock.patch("locust.rpc.rpc.SlaveServer", mocked_rpc_server()) as server:
-            with mock.patch("locust.runners.slave.Process", mocked_process()):
-                self.slave = SlaveLocustRunner(MyTestLocust, config.locust_config())
-                server.mocked_send('all', Message("worker_ready", None, "zeh_fake_client1"))
-                sleep(0)
-                self.slave.start_hatching(1, 1)
-                server.mocked_send('all', Message("pong", None, "zeh_fake_client0"))
-                sleep(0)
-                msgs = filter(lambda x: x[0] == 'zeh_fake_client0', server.outbox_direct)
-                msgs = [Message.unserialize(msg[1]).type for msg in msgs]
-                self.assertEqual(len(msgs), 1)
-                self.assertEqual(msgs[0], 'quit')
-
-    def test_worker_stats_report_median(self):
-        import mock
-
-        class MyTestLocust(Locust):
-            pass
-
-        with mock.patch("locust.rpc.rpc.SlaveServer", mocked_rpc_server()) as server:
-            with mock.patch("locust.runners.slave.Process", mocked_process()):
-                self.slave = SlaveLocustRunner(MyTestLocust, config.locust_config())
-                server.mocked_send('all', Message("worker_ready", None, "fake_client"))
-                sleep(0)
-                self.slave.start_hatching(1, 1)
-
-                self.slave.stats.get("Task", "/", "GET").log(100, 23455)
-                self.slave.stats.get("Task", "/", "GET").log(800, 23455)
-                self.slave.stats.get("Task", "/", "GET").log(700, 23455)
-
-                data = {"user_count": 1}
-                events.report_to_master.fire(node_id="fake_client", data=data)
-                self.slave.stats.clear_all()
-
-                server.mocked_send("all", Message("stats", data, "fake_client"))
-                sleep(0)
-                s = self.slave.stats.get("Task", "/", "GET")
-                self.assertEqual(700, s.median_response_time)
-
-    def test_spawn_uneven_locusts(self):
-        """
-        Tests that we can accurately spawn a certain number of locusts, even if it's not an
-        even number of the connected slaves
-        """
-        import mock
-
-        class MyTestLocust(Locust):
-            pass
-
-        with mock.patch("locust.rpc.rpc.SlaveServer", mocked_rpc_server()) as server:
-            with mock.patch("locust.runners.slave.Process", mocked_process()):
-                self.slave = SlaveLocustRunner(MyTestLocust, config.locust_config())
-                server.mocked_send('all', Message("worker_ready", None, "fake_client0"))
-                sleep(0)
-                self.slave.start_hatching(1, 1)
-                for i in range(1, 5):
-                    server.mocked_send("all", Message("worker_ready", None, "fake_client%i" % i))
-                    sleep(0)
-
-                del server.outbox_direct[:]
-                self.slave.start_hatching(42, 7)
-
-                self.assertEqual(3, len(server.outbox_direct))
-
-                num_clients = 0
-                for msg in server.outbox_direct:
-                    num_clients += Message.unserialize(msg[1]).data["num_clients"]
-                self.assertEqual(
-                    42,
-                    num_clients,
-                    "Total number of locusts that would have been spawned is not 42"
-                )
-
-    def test_worker_amount_spawn(self):
-        import mock
-
-        class MyTestLocust(Locust):
-            pass
-
-        with mock.patch("locust.rpc.rpc.SlaveServer", mocked_rpc_server()) as server:
-            with mock.patch("locust.runners.slave.Process", mocked_process()) as processes:
-                self.slave = SlaveLocustRunner(MyTestLocust, config.locust_config())
-
-                timeout = gevent.Timeout(3.0)
-                timeout.start()
-
-                try:
-                    for i in range(3):
-                        server.mocked_send("all", Message("worker_ready", None, "fake_client%i" % i))
-                    self.slave.start_hatching(42, 2)
-                except gevent.Timeout:
-                    self.fail("Got Timeout exception")
-                finally:
-                    timeout.cancel()
-
-                self.assertEqual(3, len(processes.started))
-                self.assertEqual(3, self.slave.worker_count)
-
-    def test_heartbeat(self):
-        import mock
-
-        class MyTestLocust(Locust):
-            pass
-
-        with mock.patch("locust.rpc.rpc.SlaveServer", mocked_rpc_server()) as server:
-            with mock.patch("locust.runners.slave.Process", mocked_process()):
-                self.slave = SlaveLocustRunner(MyTestLocust, config.locust_config())
-                server.mocked_send('all', Message("worker_ready", None, "fake_client0"))
-                self.slave.start_hatching(1, 1)
-                sleep(runners.slave.HEARTBEAT_INTERVAL)
-
-                self.assertEqual(1, len(server.outbox_all))
-                self.assertEqual('ping', Message.unserialize(server.outbox_all[0]).type)
-                server.mocked_send('all', Message("pong", None, "fake_client0"))
-                sleep(runners.slave.HEARTBEAT_INTERVAL)
-                self.assertEqual(1, self.slave.worker_count)
-                sleep(runners.slave.HEARTBEAT_INTERVAL)
-                self.assertEqual(0, self.slave.worker_count)
-
-
-    def worker_relaunch(self):
-        import mock
-
-        class MyTestLocust(Locust):
-            pass
-
-        with mock.patch("locust.rpc.rpc.SlaveServer", mocked_rpc_server()) as server:
-            with mock.patch("locust.rpc.rpc.SlaveClient", mocked_rpc_server()) as client:
-                with mock.patch("locust.runners.slave.Process", mocked_process()) as processes:
-                    self.slave = SlaveLocustRunner(MyTestLocust, config.locust_config())
-                    server.mocked_send('all', Message("worker_ready", None, "fake_client0"))
-                    self.slave.start_hatching(1, 1)
-                    self.assertEqual(1, len(processes.started))
-                    sleep(2 * runners.slave.HEARTBEAT_INTERVAL)
-                    self.assertEqual(0, self.slave.worker_count)
-                    client.mocked_send('all', Message("ping", None, "master"))
-                    sleep(runners.slave.HEARTBEAT_INTERVAL)
-                    self.assertEqual(2, len(processes.started))
-
-    def test_on_ping(self):
-        import mock
-
-        class MyTestLocust(Locust):
-            pass
-
-        with mock.patch("locust.rpc.rpc.SlaveClient", mocked_rpc_server()) as client:
-            with mock.patch("locust.runners.slave.Process", mocked_process()) as processes:
-                self.slave = SlaveLocustRunner(MyTestLocust, config.locust_config())
-                sleep(0)
-                self.assertEqual(2, len(client.outbox_all))
-                client.mocked_send('all', Message("ping", None, "master"))
-                sleep(0)
-                self.assertEqual(3, len(client.outbox_all))
-
-    def test_on_hatch(self):
-        import mock
-
-        class MyTestLocust(Locust):
-            pass
-
-        with mock.patch("locust.rpc.rpc.SlaveServer", mocked_rpc_server()) as server:
-            with mock.patch("locust.rpc.rpc.SlaveClient", mocked_rpc_server()) as client:
-                with mock.patch("locust.runners.slave.Process", mocked_process()) as processes:
-                    self.slave = SlaveLocustRunner(MyTestLocust, config.locust_config())
-                    for i in range(5):
-                        server.mocked_send("all", Message("worker_ready", None, "fake_client%i" % i))
-
-                    timeout = gevent.Timeout(2.0)
-                    timeout.start()
-
-                    try:
-                        data = {
-                            "hatch_rate": 10,
-                            "num_clients": 43,
-                            "num_requests": None,
-                            "host": 'host',
-                            "stop_timeout": None
-                        }
-                        client.mocked_send('all', Message("hatch", data, "master"))
-                    except gevent.Timeout:
-                        self.fail("Got Timeout exception. A locust seems to have been spawned, even though 0 was specified.")
-                    finally:
-                        timeout.cancel()
-
-                    sleep(0)
-                    self.assertEqual(3, len(processes.started))
-
-    def test_stats_reporting(self):
-        import mock
-
-        class MyTestLocust(Locust):
-            pass
-
-        with mock.patch("locust.rpc.rpc.SlaveServer", mocked_rpc_server()) as server:
-            with mock.patch("locust.rpc.rpc.SlaveClient", mocked_rpc_server()) as client:
-                with mock.patch("locust.runners.slave.Process", mocked_process()) as processes:
-                    self.slave = SlaveLocustRunner(MyTestLocust, config.locust_config())
-                    server.mocked_send('all', Message("worker_ready", None, "fake_client0"))
-                    self.slave.start_hatching(1, 1)
-
-                    self.slave.stats.get("Task", "/", "GET").log(100, 23455)
-                    self.slave.stats.get("Task", "/", "GET").log(800, 23455)
-                    self.slave.stats.get("Task", "/", "GET").log(700, 23455)
-
-                    sleep(runners.slave.SLAVE_STATS_INTERVAL + 0.1)
-                    messages = [Message.unserialize(msg) for msg in client.outbox_all]
-                    data = filter(lambda m: m.type == 'stats' and m.data['stats'], messages)[0].data
-
-                    self.assertEqual({800: 1, 100: 1, 700: 1}, data['stats'][0]['response_times'])
-                    self.assertEqual(3, data['stats'][0]['num_requests'])
-                    self.assertEqual(1600, data['stats'][0]['total_response_time'])
-                    self.assertEqual(1, data['worker_count'])
-
-
-class TestWorkerRunner(LocustTestCase):
-
-    def setUp(self):
-        global_stats.reset_all()
-        self._slave_report_event_handlers = [h for h in events.node_report._handlers]
-
-    def tearDown(self):
-        events.node_report._handlers = self._slave_report_event_handlers
-        self.worker.quit()
-
-    def test_on_ping(self):
-        import mock
-
-        class MyTestLocust(Locust):
-            pass
-
-        with mock.patch("locust.rpc.rpc.WorkerClient", mocked_rpc_server()) as client:
-            self.worker = WorkerLocustRunner(MyTestLocust, config.locust_config())
-            sleep(0)
-            self.assertEqual(2, len(client.outbox_all))
-            client.mocked_send('all', Message("ping", None, "master"))
-            sleep(0)
-            self.assertEqual(3, len(client.outbox_all))
-
-    def test_on_hatch(self):
-        import mock
-
+    def test_spawn_zero_locusts(self):
         class MyTaskSet(TaskSet):
             @task
             def my_task(self):
                 pass
-
+            
         class MyTestLocust(Locust):
             task_set = MyTaskSet
-            min_wait = 100
-            max_wait = 100
-
-        with mock.patch("locust.rpc.rpc.WorkerClient", mocked_rpc_server()) as client:
-            self.worker = WorkerLocustRunner([MyTestLocust], config.locust_config())
-
-            data = {
-                "hatch_rate": 10,
-                "num_clients": 10,
-                "num_requests": None,
-                "host": 'host',
-                "stop_timeout": None
-            }
-            client.mocked_send('all', Message("hatch", data, "slave"))
-            sleep(2)
-            self.assertEqual(10, self.worker.user_count)
-
-    def test_stats_reporting(self):
-        import mock
-
+            wait_time = constant(0.1)
+        
+        runner = LocalLocustRunner([MyTestLocust], self.options)
+        
+        timeout = gevent.Timeout(2.0)
+        timeout.start()
+        
+        try:
+            runner.start_hatching(0, 1, wait=True)
+            runner.greenlet.join()
+        except gevent.Timeout:
+            self.fail("Got Timeout exception. A locust seems to have been spawned, even though 0 was specified.")
+        finally:
+            timeout.cancel()
+    
+    def test_spawn_uneven_locusts(self):
+        """
+        Tests that we can accurately spawn a certain number of locusts, even if it's not an 
+        even number of the connected slaves
+        """
+        class MyTestLocust(Locust):
+            pass
+        
+        with mock.patch("locust.rpc.rpc.Server", mocked_rpc()) as server:
+            master = MasterLocustRunner(MyTestLocust, self.options)
+            for i in range(5):
+                server.mocked_send(Message("client_ready", None, "fake_client%i" % i))
+            
+            master.start_hatching(7, 7)
+            self.assertEqual(5, len(server.outbox))
+            
+            num_clients = 0
+            for _, msg in server.outbox:
+                num_clients += msg.data["num_clients"]
+            
+            self.assertEqual(7, num_clients, "Total number of locusts that would have been spawned is not 7")
+    
+    def test_spawn_fewer_locusts_than_slaves(self):
+        class MyTestLocust(Locust):
+            pass
+        
+        with mock.patch("locust.rpc.rpc.Server", mocked_rpc()) as server:
+            master = MasterLocustRunner(MyTestLocust, self.options)
+            for i in range(5):
+                server.mocked_send(Message("client_ready", None, "fake_client%i" % i))
+            
+            master.start_hatching(2, 2)
+            self.assertEqual(5, len(server.outbox))
+            
+            num_clients = 0
+            for _, msg in server.outbox:
+                num_clients += msg.data["num_clients"]
+            
+            self.assertEqual(2, num_clients, "Total number of locusts that would have been spawned is not 2")
+    
+    def test_spawn_locusts_in_stepload_mode(self):
         class MyTestLocust(Locust):
             pass
 
+        with mock.patch("locust.rpc.rpc.Server", mocked_rpc()) as server:
+            master = MasterLocustRunner(MyTestLocust, self.options)
+            for i in range(5):
+                server.mocked_send(Message("client_ready", None, "fake_client%i" % i))
 
-        with mock.patch("locust.rpc.rpc.WorkerClient", mocked_rpc_server()) as client:
-            self.worker = WorkerLocustRunner([MyTestLocust], config.locust_config())
+            # start a new swarming in Step Load mode: total locust count of 10, hatch rate of 2, step locust count of 5, step duration of 5s
+            master.start_stepload(10, 2, 5, 5)
 
-            self.worker.stats.get("Task", "/", "GET").log(100, 23455)
-            self.worker.stats.get("Task", "/", "GET").log(800, 23455)
-            self.worker.stats.get("Task", "/", "GET").log(700, 23455)
+            # make sure the first step run is started
+            sleep(1)
+            self.assertEqual(5, len(server.outbox))
 
-            sleep(runners.worker.WORKER_STATS_INTERVAL)
-            data = Message.unserialize(client.outbox_all[-1]).data
+            num_clients = 0
+            end_of_last_step = len(server.outbox)
+            for _, msg in server.outbox:
+                num_clients += msg.data["num_clients"]
 
-            self.assertEqual({800: 1, 100: 1, 700: 1}, data['stats'][0]['response_times'])
-            self.assertEqual(3, data['stats'][0]['num_requests'])
-            self.assertEqual(1600, data['stats'][0]['total_response_time'])
+            self.assertEqual(5, num_clients, "Total number of locusts that would have been spawned for first step is not 5")
+
+            # make sure the first step run is complete
+            sleep(5)
+            num_clients = 0
+            idx = end_of_last_step
+            while idx < len(server.outbox):
+                msg = server.outbox[idx][1]
+                num_clients += msg.data["num_clients"]
+                idx += 1
+            self.assertEqual(10, num_clients, "Total number of locusts that would have been spawned for second step is not 10")
+
+    def test_exception_in_task(self):
+        class HeyAnException(Exception):
+            pass
+        
+        class MyLocust(Locust):
+            class task_set(TaskSet):
+                @task
+                def will_error(self):
+                    raise HeyAnException(":(")
+        
+        runner = LocalLocustRunner([MyLocust], self.options)
+        
+        l = MyLocust()
+        l._catch_exceptions = False
+        
+        self.assertRaises(HeyAnException, l.run)
+        self.assertRaises(HeyAnException, l.run)
+        self.assertEqual(1, len(runner.exceptions))
+        
+        hash_key, exception = runner.exceptions.popitem()
+        self.assertTrue("traceback" in exception)
+        self.assertTrue("HeyAnException" in exception["traceback"])
+        self.assertEqual(2, exception["count"])
+    
+    def test_exception_is_catched(self):
+        """ Test that exceptions are stored, and execution continues """
+        class HeyAnException(Exception):
+            pass
+        
+        class MyTaskSet(TaskSet):
+            def __init__(self, *a, **kw):
+                super(MyTaskSet, self).__init__(*a, **kw)
+                self._task_queue = [
+                    {"callable":self.will_error, "args":[], "kwargs":{}}, 
+                    {"callable":self.will_stop, "args":[], "kwargs":{}},
+                ]
+            
+            @task(1)
+            def will_error(self):
+                raise HeyAnException(":(")
+            
+            @task(1)
+            def will_stop(self):
+                self.interrupt()
+        
+        class MyLocust(Locust):
+            wait_time = constant(0.01)
+            task_set = MyTaskSet
+        
+        runner = LocalLocustRunner([MyLocust], self.options)
+        l = MyLocust()
+        
+        # supress stderr
+        with mock.patch("sys.stderr") as mocked:
+            l.task_set._task_queue = [l.task_set.will_error, l.task_set.will_stop]
+            self.assertRaises(LocustError, l.run) # make sure HeyAnException isn't raised
+            l.task_set._task_queue = [l.task_set.will_error, l.task_set.will_stop]
+            self.assertRaises(LocustError, l.run) # make sure HeyAnException isn't raised
+        self.assertEqual(2, len(mocked.method_calls))
+        
+        # make sure exception was stored
+        self.assertEqual(1, len(runner.exceptions))
+        hash_key, exception = runner.exceptions.popitem()
+        self.assertTrue("traceback" in exception)
+        self.assertTrue("HeyAnException" in exception["traceback"])
+        self.assertEqual(2, exception["count"])
+
+
+class TestSlaveLocustRunner(LocustTestCase):
+    def setUp(self):
+        super(TestSlaveLocustRunner, self).setUp()
+        global_stats.reset_all()
+        self._report_to_master_event_handlers = [h for h in events.report_to_master._handlers]
+
+    def tearDown(self):
+        events.report_to_master._handlers = self._report_to_master_event_handlers
+        super(TestSlaveLocustRunner, self).tearDown()
+
+    def test_slave_stop_timeout(self):
+        class MyTestLocust(Locust):
+            _test_state = 0
+            class task_set(TaskSet):
+                wait_time = constant(0)
+                @task
+                def the_task(self):
+                    MyTestLocust._test_state = 1
+                    gevent.sleep(0.2)
+                    MyTestLocust._test_state = 2
+
+        with mock.patch("locust.rpc.rpc.Client", mocked_rpc()) as client:
+            options = mocked_options()
+            slave = SlaveLocustRunner([MyTestLocust], options)
+            self.assertEqual(1, len(client.outbox))
+            self.assertEqual("client_ready", client.outbox[0].type)
+            client.mocked_send(Message("hatch", {
+                "hatch_rate": 1,
+                "num_clients": 1,
+                "host": "",
+                "stop_timeout": 1,
+            }, "dummy_client_id"))
+            #print("outbox:", client.outbox)
+            # wait for slave to hatch locusts
+            self.assertIn("hatching", [m.type for m in client.outbox])
+            slave.hatching_greenlet.join()
+            self.assertEqual(1, len(slave.locusts))
+            # check that locust has started running
+            gevent.sleep(0.01)
+            self.assertEqual(1, MyTestLocust._test_state)
+            # send stop message
+            client.mocked_send(Message("stop", None, "dummy_client_id"))
+            slave.locusts.join()
+            # check that locust user got to finish
+            self.assertEqual(2, MyTestLocust._test_state)
+
+    def test_slave_without_stop_timeout(self):
+        class MyTestLocust(Locust):
+            _test_state = 0
+            class task_set(TaskSet):
+                wait_time = constant(0)
+                @task
+                def the_task(self):
+                    MyTestLocust._test_state = 1
+                    gevent.sleep(0.2)
+                    MyTestLocust._test_state = 2
+
+        with mock.patch("locust.rpc.rpc.Client", mocked_rpc()) as client:
+            options = mocked_options()
+            options.stop_timeout = None
+            slave = SlaveLocustRunner([MyTestLocust], options)
+            self.assertEqual(1, len(client.outbox))
+            self.assertEqual("client_ready", client.outbox[0].type)
+            client.mocked_send(Message("hatch", {
+                "hatch_rate": 1,
+                "num_clients": 1,
+                "host": "",
+                "stop_timeout": None,
+            }, "dummy_client_id"))
+            #print("outbox:", client.outbox)
+            # wait for slave to hatch locusts
+            self.assertIn("hatching", [m.type for m in client.outbox])
+            slave.hatching_greenlet.join()
+            self.assertEqual(1, len(slave.locusts))
+            # check that locust has started running
+            gevent.sleep(0.01)
+            self.assertEqual(1, MyTestLocust._test_state)
+            # send stop message
+            client.mocked_send(Message("stop", None, "dummy_client_id"))
+            slave.locusts.join()
+            # check that locust user did not get to finish
+            self.assertEqual(1, MyTestLocust._test_state)
+
 
 
 class TestMessageSerializing(unittest.TestCase):
@@ -642,17 +615,80 @@ class TestMessageSerializing(unittest.TestCase):
         self.assertEqual(msg.data, rebuilt.data)
         self.assertEqual(msg.node_id, rebuilt.node_id)
 
+class TestStopTimeout(LocustTestCase):
+    def test_stop_timeout(self):
+        short_time = 0.05
+        class MyTaskSet(TaskSet):
+            @task
+            def my_task(self):
+                MyTaskSet.state = "first"
+                gevent.sleep(short_time)
+                MyTaskSet.state = "second" # should only run when run time + stop_timeout is > short_time
+                gevent.sleep(short_time)
+                MyTaskSet.state = "third" # should only run when run time + stop_timeout is > short_time * 2
 
-class TestLocustRunner(LocustTestCase):
-    def setUp(self):
-        global_stats.reset_all()
-        self._slave_report_event_handlers = [h for h in events.node_report._handlers]
+        class MyTestLocust(Locust):
+            task_set = MyTaskSet
+            wait_time = constant(0)
 
-    def tearDown(self):
-        events.node_report._handlers = self._slave_report_event_handlers
-        self.runner.stop()
+        options = mocked_options()
+        runner = LocalLocustRunner([MyTestLocust], options)
+        runner.start_hatching(1, 1)
+        gevent.sleep(short_time / 2)
+        runner.quit()
+        self.assertEqual("first", MyTaskSet.state)
 
-    def test_spawn_zero_locusts(self):
+        options.stop_timeout = short_time / 2 # exit with timeout
+        runner = LocalLocustRunner([MyTestLocust], options)
+        runner.start_hatching(1, 1)
+        gevent.sleep(short_time)
+        runner.quit()
+        self.assertEqual("second", MyTaskSet.state)
+
+        options.stop_timeout = short_time * 3 # allow task iteration to complete, with some margin
+        runner = LocalLocustRunner([MyTestLocust], options)
+        runner.start_hatching(1, 1)
+        gevent.sleep(short_time)
+        timeout = gevent.Timeout(short_time * 2)
+        timeout.start()
+        try:
+            runner.quit()
+            runner.greenlet.join()
+        except gevent.Timeout:
+            self.fail("Got Timeout exception. Some locusts must have kept runnining after iteration finish")
+        finally:
+            timeout.cancel()
+        self.assertEqual("third", MyTaskSet.state)
+
+    def test_stop_timeout_during_on_start(self):
+        short_time = 0.05
+        class MyTaskSet(TaskSet):
+            finished_on_start = False
+            my_task_run = False
+            def on_start(self):
+                gevent.sleep(short_time)
+                MyTaskSet.finished_on_start = True
+
+            @task
+            def my_task(self):
+                MyTaskSet.my_task_run = True
+
+        class MyTestLocust(Locust):
+            task_set = MyTaskSet
+            wait_time = constant(0)
+
+        options = mocked_options()
+        options.stop_timeout = short_time
+        runner = LocalLocustRunner([MyTestLocust], options)
+        runner.start_hatching(1, 1)
+        gevent.sleep(short_time / 2)
+        runner.quit()
+
+        self.assertTrue(MyTaskSet.finished_on_start)
+        self.assertFalse(MyTaskSet.my_task_run)
+
+    def test_stop_timeout_exit_during_wait(self):
+        short_time = 0.05
         class MyTaskSet(TaskSet):
             @task
             def my_task(self):
@@ -660,85 +696,94 @@ class TestLocustRunner(LocustTestCase):
 
         class MyTestLocust(Locust):
             task_set = MyTaskSet
-            min_wait = 100
-            max_wait = 100
+            wait_time = between(1, 1)
 
-        self.runner = LocustRunner([MyTestLocust], config.locust_config())
-
-        timeout = gevent.Timeout(2.0)
+        options = mocked_options()
+        options.stop_timeout = short_time
+        runner = LocalLocustRunner([MyTestLocust], options)
+        runner.start_hatching(1, 1)
+        gevent.sleep(short_time) # sleep to make sure locust has had time to start waiting
+        timeout = gevent.Timeout(short_time)
         timeout.start()
-
         try:
-            self.runner.start_hatching(0, 1, wait=True)
+            runner.quit()
+            runner.greenlet.join()
         except gevent.Timeout:
-            self.fail("Got Timeout exception. A locust seems to have been spawned, even though 0 was specified.")
+            self.fail("Got Timeout exception. Waiting locusts should stop immediately, even when using stop_timeout.")
         finally:
             timeout.cancel()
 
-    def test_exception_in_task(self):
-        class HeyAnException(Exception):
-            pass
-
-        class MyLocust(WebLocust):
-            class task_set(TaskSet):
-                @task
-                def will_error(self):
-                    raise HeyAnException(":(")
-
-        self.runner = LocustRunner([MyLocust], config.locust_config())
-
-        l = MyLocust(config.locust_config())
-        l._catch_exceptions = False
-
-        self.assertRaises(HeyAnException, l.run)
-        self.assertRaises(HeyAnException, l.run)
-        self.assertEqual(1, len(self.runner.exceptions))
-
-        hash_key, exception = self.runner.exceptions.popitem()
-        self.assertTrue("traceback" in exception)
-        self.assertTrue("HeyAnException" in exception["traceback"])
-        self.assertEqual(2, exception["count"])
-
-    def test_exception_is_catched(self):
-        """ Test that exceptions are stored, and execution continues """
-        class HeyAnException(Exception):
-            pass
+    def test_stop_timeout_with_interrupt(self):
+        short_time = 0.05
+        class MySubTaskSet(TaskSet):
+            @task
+            def a_task(self):
+                gevent.sleep(0)
+                self.interrupt(reschedule=True)
 
         class MyTaskSet(TaskSet):
-            def __init__(self, *a, **kw):
-                super(MyTaskSet, self).__init__(*a, **kw)
-                self._task_queue = [
-                    {"callable":self.will_error, "args":[], "kwargs":{}},
-                    {"callable":self.will_stop, "args":[], "kwargs":{}},
-                ]
+            tasks = [MySubTaskSet]
 
-            @task(1)
-            def will_error(self):
-                raise HeyAnException(":(")
-
-            @task(1)
-            def will_stop(self):
-                self.interrupt()
-
-        class MyLocust(WebLocust):
-            min_wait = 10
-            max_wait = 10
+        class MyTestLocust(Locust):
             task_set = MyTaskSet
 
-        self.runner = LocustRunner([MyLocust], config.locust_config())
-        l = MyLocust(config.locust_config())
+        options = mocked_options()
+        options.stop_timeout = short_time
+        runner = LocalLocustRunner([MyTestLocust], options)
+        runner.start_hatching(1, 1)
+        gevent.sleep(0)
+        timeout = gevent.Timeout(short_time)
+        timeout.start()
+        try:
+            runner.quit()
+            runner.greenlet.join()
+        except gevent.Timeout:
+            self.fail("Got Timeout exception. Interrupted locusts should exit immediately during stop_timeout.")
+        finally:
+            timeout.cancel()
 
-        # supress stderr
-        with mock.patch("sys.stderr") as mocked:
-            l.task_set._task_queue = [l.task_set.will_error, l.task_set.will_stop]
-            self.assertRaises(LocustError, l.run) # make sure HeyAnException isn't raised
-            l.task_set._task_queue = [l.task_set.will_error, l.task_set.will_stop]
-            self.assertRaises(LocustError, l.run) # make sure HeyAnException isn't raised
-        self.assertEqual(2, len(mocked.method_calls))
+    def test_kill_locusts_with_stop_timeout(self):
+        short_time = 0.05
+        class MyTaskSet(TaskSet):
+            @task
+            def my_task(self):
+                MyTaskSet.state = "first"
+                gevent.sleep(short_time)
+                MyTaskSet.state = "second" # should only run when run time + stop_timeout is > short_time
+                gevent.sleep(short_time)
+                MyTaskSet.state = "third" # should only run when run time + stop_timeout is > short_time * 2
 
-        # make sure exception was stored
-        self.assertEqual(1, len(self.runner.exceptions))
-        hash_key, exception = self.runner.exceptions.popitem()
-        self.assertTrue("traceback" in exception)
-        self.assertTrue("HeyAnException" in exception["traceback"])
-        self.assertEqual(2, exception["count"])
+        class MyTestLocust(Locust):
+            task_set = MyTaskSet
+            wait_time = constant(0)
+
+        options = mocked_options()
+        runner = LocalLocustRunner([MyTestLocust], options)
+        runner.start_hatching(1, 1)
+        gevent.sleep(short_time / 2)
+        runner.kill_locusts(1)
+        self.assertEqual("first", MyTaskSet.state)
+        runner.quit()
+
+        options.stop_timeout = short_time / 2 # exit with timeout
+        runner = LocalLocustRunner([MyTestLocust], options)
+        runner.start_hatching(1, 1)
+        gevent.sleep(short_time)
+        runner.kill_locusts(1)
+        self.assertEqual("second", MyTaskSet.state)
+        runner.quit()
+
+        options.stop_timeout = short_time * 3 # allow task iteration to complete, with some margin
+        runner = LocalLocustRunner([MyTestLocust], options)
+        runner.start_hatching(1, 1)
+        gevent.sleep(short_time)
+        timeout = gevent.Timeout(short_time * 2)
+        timeout.start()
+        try:
+            runner.kill_locusts(1)
+            runner.locusts.join()
+        except gevent.Timeout:
+            self.fail("Got Timeout exception. Some locusts must have kept runnining after iteration finish")
+        finally:
+            timeout.cancel()
+        self.assertEqual("third", MyTaskSet.state)

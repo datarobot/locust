@@ -1,10 +1,7 @@
 """Master Locust runner. Represent master for distributed worker sceduler process"""
-import os
-import sys
-import time
-import pickle
 import logging
-import subprocess
+import time
+from multiprocessing import Process
 
 import gevent
 from gevent.pool import Group
@@ -28,16 +25,6 @@ class MasterLocustRunner(DistributedLocustRunner):
         def __init__(self, master):
             self.master = master
 
-        def _validate_msg(fun):
-            def wraper(inst, msg):
-                msg.node_id = msg.node_id.encode('ascii')
-                if msg.node_id in inst.master.slaves.keys():
-                    fun(inst, msg)
-                else:
-                    logger.warn('Unknown Slave. Reply unknown: %s.', msg.node_id)
-                    inst.master.server.send_to(msg.node_id, Message("unknown", None, None))
-            return wraper
-
         def on_slave_ready(self, msg):
             id = msg.node_id.encode('ascii')
             self.master.slaves[id] = Node(id)
@@ -46,25 +33,19 @@ class MasterLocustRunner(DistributedLocustRunner):
                 id,
                 len(self.master.slaves.ready)
             )
-            options = self.master.options.to_dict()
-            self.master.server.send_to(id, Message("new_config", options, None))
 
-        @_validate_msg
         def on_slave_stopped(self, msg):
             del self.master.slaves[msg.node_id]
             if len(self.master.slaves.hatching + self.master.slaves.running) == 0:
                 self.master.state = STATE.STOPPED
                 logger.info("Removing %s slave from running slaves", msg.node_id)
 
-        @_validate_msg
         def on_stats(self, msg):
             events.node_report.fire(node_id=msg.node_id, data=msg.data)
 
-        @_validate_msg
         def on_hatching(self, msg):
             self.master.slaves[msg.node_id].state = STATE.HATCHING
 
-        @_validate_msg
         def on_hatch_complete(self, msg):
             self.master.slaves[msg.node_id].state = STATE.RUNNING
             self.master.slaves[msg.node_id].user_count = msg.data["count"]
@@ -73,7 +54,6 @@ class MasterLocustRunner(DistributedLocustRunner):
                 events.hatch_complete.fire(user_count=count)
                 self.master.state = STATE.RUNNING
 
-        @_validate_msg
         def on_quit(self, msg):
             if msg.node_id in self.master.slaves:
                 del self.master.slaves[msg.node_id]
@@ -83,21 +63,17 @@ class MasterLocustRunner(DistributedLocustRunner):
                     len(self.master.slaves.ready)
                 )
 
-        @_validate_msg
         def on_exception(self, msg):
             self.master.log_exception(msg.node_id, msg.data["msg"], msg.data["traceback"])
 
-        @_validate_msg
         def on_pong(self, msg):
             self.master.slaves[msg.node_id].ping_answ = True
-            self.master.slaves[msg.node_id].ping_missed = 0
 
 
     def __init__(self, locust_classes, options):
         super(MasterLocustRunner, self).__init__(locust_classes, options)
 
         self.state = STATE.INIT
-        self.exceptions = {}
         self.server = rpc.MasterServer(self.master_bind_host, self.master_bind_port)
         self.server.bind_handler(self.MasterServerHandler(self))
         self.greenlet = Group()
@@ -117,10 +93,11 @@ class MasterLocustRunner(DistributedLocustRunner):
             self.quit()
         events.quitting += on_quitting
 
+        # self.server.send_all(Message("quit", None, None))
+
         self.spawn_slave()
         self.greenlet.spawn(self.slaves_listener).link_exception(callback=self.noop)
         self.wait_for_slaves(1)
-        self.greenlet.spawn(self.heartbeat).link_exception(callback=self.noop)
 
     @property
     def user_count(self):
@@ -139,22 +116,16 @@ class MasterLocustRunner(DistributedLocustRunner):
         return self.stats.entries
 
     @property
-    def task_stats(self):
-        return self.stats.tasks
-
-    @property
     def errors(self):
         return self.stats.errors
 
     def spawn_slave(self):
-        path = os.path.dirname(os.path.abspath(__file__)) + '/subrunner.py'
-        options = pickle.dumps(self.options)
-        command = "{} {} --process slave --options \"{}\"".format(
-            sys.executable, path, options
-        )
-        locusts = [sys.modules[lc.__module__].__file__ for lc in self.locust_classes]
-        command += ' ' + ' '.join(locusts)
-        subprocess.Popen([command], shell=True)
+        pid = Process(target=SlaveLocustRunner.spawn, args=(
+            self.locust_classes,
+            self.options,
+            self
+        ))
+        pid.start()
 
     def wait_for_slaves(self, n=0):
         counter = 0
@@ -167,22 +138,10 @@ class MasterLocustRunner(DistributedLocustRunner):
             self.slave_count, n
         ))
 
-    def propagate_config(self, updates=None):
-        if updates is not None:
-            self.options.update_config(updates)
-        self.server.send_all(Message("new_config", self.options.to_dict(), None))
-
     def stop(self):
         for _slave in self.slaves.hatching + self.slaves.running:
             self.server.send_all(Message("stop", None, None))
         events.master_stop_hatching.fire()
-        counter = 0
-        while counter <= SLAVE_INIT_TIMEOUT:
-            if len(self.slaves.hatching + self.slaves.running) == 0:
-                return
-            gevent.sleep(1)
-            counter += 1
-        raise Exception("Some slaves were not stopped")
 
     def quit(self):
         self.server.send_all(Message("quit", None, None))
@@ -193,12 +152,9 @@ class MasterLocustRunner(DistributedLocustRunner):
         while True:
             gen = (w for w in self.slaves.copy().itervalues() if not w.ping_answ)
             for dead_slave in gen:
-                if dead_slave.ping_missed > 3:
-                    self.server.send_to(dead_slave.id, Message("unknown", None, None))
-                    del self.slaves[dead_slave.id]
-                    logger.warn("Connection to %s slave was lost", dead_slave.id)
-                else:
-                    dead_slave.ping_missed += 1
+                self.server.send_to(dead_slave.id, Message("quit", None, None))
+                del self.slaves[dead_slave.id]
+                logger.warn("Connection to %s was slave lost", dead_slave.id)
 
             for slave in self.slaves.itervalues():
                 slave.ping_answ = False
@@ -208,29 +164,22 @@ class MasterLocustRunner(DistributedLocustRunner):
     def slaves_listener(self):
         while True:
             self.server.recv()
-            gevent.sleep()
 
     def start_hatching(self, locust_count, hatch_rate):
+        self.state = STATE.HATCHING
         worker_num = self.slave_count
 
-        if self.state != STATE.INIT and self.state != STATE.STOPPED:
-            self.stop()
+        if self.state != STATE.RUNNING and self.state != STATE.HATCHING:
+            self.stats.clear_all()
+            self.exceptions = {}
+            events.master_start_hatching.fire()
 
-        self.stats.clear_all()
-        self.stats.reset_all()
-        self.exceptions = {}
-        events.master_start_hatching.fire()
-        self.state = STATE.HATCHING
+        self.greenlet.spawn(self.heartbeat).link_exception(callback=self.noop)
 
-        leftover = locust_count - (locust_count / worker_num) * worker_num
-        adjust = lambda x: 1 if x <= leftover else 0
-        calc = lambda x: locust_count / worker_num + adjust(x)
+        calc = lambda x: locust_count / worker_num + 1 - x // worker_num
         slave_locust_count = [calc(x) for x in range(1, worker_num + 1)]
         slave_hatch_rate = hatch_rate / float(worker_num)
-        if self.options.num_requests:
-            slave_num_requests = int(self.options.num_requests / self.slave_count)
-        else:
-            slave_num_requests = None
+        slave_num_requests = self.num_requests / 4 if self.num_requests else None
 
         logger.info("Sending hatch jobs to %d ready slave(s)", worker_num)
 
@@ -238,20 +187,12 @@ class MasterLocustRunner(DistributedLocustRunner):
             data = {
                 "hatch_rate": slave_hatch_rate,
                 "num_clients": client_rate,
-                "num_requests": slave_num_requests
+                "num_requests": slave_num_requests,
+                "host": self.host,
+                "stop_timeout": None
             }
             self.server.send_to(slave_id, Message("hatch", data, None))
             self.slaves[slave_id].task = data
 
         self.stats.start_time = time.time()
         self.state = STATE.HATCHING
-
-    def log_exception(self, node_id, msg, formatted_tb):
-        key = hash(formatted_tb)
-        row = self.exceptions.setdefault(
-            key,
-            {"count": 0, "msg": msg, "traceback": formatted_tb, "nodes": set()}
-        )
-        row["count"] += 1
-        row["nodes"].add(node_id)
-        self.exceptions[key] = row
