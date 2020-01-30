@@ -11,9 +11,6 @@ class EventHook(object):
             print "Event was fired with arguments: %s, %s" % (a, b)
         my_event += on_my_event
         my_event.fire(a="foo", b="bar")
-
-    If reverse is True, then the handlers will run in the reverse order
-    that they were inserted
     """
 
     def __init__(self):
@@ -27,11 +24,12 @@ class EventHook(object):
         self._handlers.remove(handler)
         return self
 
-    def fire(self, reverse=False, **kwargs):
-        if reverse:
-            self._handlers.reverse()
+    def fire(self, **kwargs):
         for handler in self._handlers:
             handler(**kwargs)
+
+    def clear(self):
+        del self._handlers[:]
 
 request_success = EventHook()
 """
@@ -54,8 +52,29 @@ Event is fired with the following arguments:
 * *request_type*: Request type method used
 * *name*: Path to the URL that was called (or override name if it was used in the call to the client)
 * *response_time*: Time in milliseconds until exception was thrown
-* *response_length*: Content-length of the response
 * *exception*: Exception instance that was thrown
+"""
+
+task_success = EventHook()
+"""
+*task_success* is fired when a task is completed successfully.
+
+Listeners should take the following arguments:
+
+* *task_name*: Task name
+* *task_time*: Time was taken for task execution
+"""
+
+task_failure = EventHook()
+"""
+*task_failure* is fired when a task is interrupted by request failure during its execution.
+
+Listeners should take the following arguments:
+
+* *task_name*: Task name
+* *task_time*: Time was taken for task execution
+* *exception*: Exception instance that was thrown
+* *action*: Exception instance that was thrown
 """
 
 locust_error = EventHook()
@@ -79,20 +98,20 @@ Note that the keys "stats" and "errors" are used by Locust and shouldn't be over
 
 Event is fired with the following arguments:
 
-* *client_id*: The client id of the running locust process.
+* *node_id*: The client id of the running locust process.
 * *data*: Data dict that can be modified in order to attach data that should be sent to the master.
 """
 
-slave_report = EventHook()
+node_report = EventHook()
 """
-*slave_report* is used when Locust is running in --master mode and is fired when the master
+*node_report* is used when Locust is running in --master mode and is fired when the master
 server receives a report from a Locust slave server.
 
 This event can be used to aggregate data from the locust slave servers.
 
 Event is fired with following arguments:
 
-* *client_id*: Client id of the reporting locust slave
+* *node_id*: Client id of the reporting locust slave
 * *data*: Data dict with the data from the slave node
 """
 
@@ -107,21 +126,21 @@ Event is fire with the following arguments:
 
 quitting = EventHook()
 """
-*quitting* is fired when the locust process is exiting
+*quitting* is fired when the locust process in exiting
 """
 
 master_start_hatching = EventHook()
 """
 *master_start_hatching* is fired when we initiate the hatching process on the master.
 
-This event is especially useful to detect when the 'start' button is clicked on the web ui.
+This event is especially usefull to detect when the 'start' button is clicked on the web ui.
 """
 
 master_stop_hatching = EventHook()
 """
 *master_stop_hatching* is fired when terminate the hatching process on the master.
 
-This event is especially useful to detect when the 'stop' button is clicked on the web ui.
+This event is especially usefull to detect when the 'stop' button is clicked on the web ui.
 """
 
 locust_start_hatching = EventHook()
@@ -133,3 +152,18 @@ locust_stop_hatching = EventHook()
 """
 *locust_stop_hatching* is fired when terminate the hatching process on any locust worker.
 """
+
+def clear_events_handlers():
+    request_success.clear()
+    request_failure.clear()
+    locust_error.clear()
+    report_to_master.clear()
+    node_report.clear()
+    hatch_complete.clear()
+    quitting.clear()
+    master_start_hatching.clear()
+    master_stop_hatching.clear()
+    locust_start_hatching.clear()
+    locust_stop_hatching.clear()
+    task_success.clear()
+    task_failure.clear()

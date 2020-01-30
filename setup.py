@@ -39,7 +39,7 @@ setup(
     author_email='',
     url='https://locust.io/',
     license='MIT',
-    packages=find_packages(exclude=['examples', 'tests']),
+    packages=find_packages(exclude=['ez_setup', 'examples', 'tests']),
     include_package_data=True,
     zip_safe=False,
     install_requires=[
@@ -51,9 +51,10 @@ setup(
         "pyzmq>=16.0.2", 
         "geventhttpclient-wheels==1.3.1.dev2",
         "ConfigArgParse==0.15.1",
+		"socketIO-client>=0.7.2,<0.8"
     ],
-    test_suite="locust.test",
-    tests_require=['mock'],
+    # test_suite="locust.test",
+    tests_require=['unittest2', 'mock', 'python-socketio'],
     entry_points={
         'console_scripts': [
             'locust = locust.main:main',

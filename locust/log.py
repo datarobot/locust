@@ -25,9 +25,6 @@ class StdOutWrapper(object):
     def write(self, s):
         stdout_logger.info(s.strip())
 
-    def isatty(self):
-        return False
-
     def flush(self, *args, **kwargs):
         """No-op for wrapper"""
         pass
@@ -38,9 +35,6 @@ class StdErrWrapper(object):
     """
     def write(self, s):
         stderr_logger.error(s.strip())
-
-    def isatty(self):
-        return False
 
     def flush(self, *args, **kwargs):
         """No-op for wrapper"""
@@ -59,3 +53,12 @@ console_logger.propagate = False
 # configure python-requests log level
 requests_log = logging.getLogger("requests")
 requests_log.setLevel(logging.WARNING)
+
+class LazyLog(object):
+    def __init__(self, func, *args, **kwargs):
+        self.func = func
+        self.args = args
+        self.kwargs = kwargs
+
+    def __str__(self):
+        return self.func(*self.args, **self.kwargs)
