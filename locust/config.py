@@ -290,6 +290,16 @@ def parse_options():
         help="The rate per second in which clients are spawned. Only used together with --no-web"
     )
 
+    # Time limit of the test run
+    parser.add_option(
+        '-t', '--run-time',
+        action='store',
+        type='str',
+        dest='run_time',
+        default=None,
+        help="Stop after the specified amount of time, e.g. (300s, 20m, 3h, 1h30m, etc.). Only used together with --no-web"
+    )
+
     # Number of requests
     parser.add_option(
         '-n', '--num-request',
