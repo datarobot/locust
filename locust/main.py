@@ -15,6 +15,7 @@ from .inspectlocust import get_task_ratio_dict, print_task_ratio
 from .log import console_logger, setup_logging
 from .stats import (print_error_report, print_percentile_stats, print_stats,
                     stats_printer, stats_writer, write_stat_csvs)
+from util import time
 
 from . import config
 
@@ -62,6 +63,22 @@ def launch(options, locusts):
         console_logger.info(dumps(task_data))
         sys.exit(0)
 
+    if options.run_time:
+        if not options.no_web:
+            logger.error("The --run-time argument can only be used together with --no-web")
+            sys.exit(1)
+        try:
+            options.run_time = time.parse_timespan(options.run_time)
+        except ValueError:
+            logger.error("Valid --time-limit formats are: 20, 20s, 3m, 2h, 1h20m, 3h30m10s, etc.")
+            sys.exit(1)
+        def spawn_run_time_limit_greenlet():
+            logger.info("Run time limit set to %s seconds" % options.run_time)
+            def timelimit_stop():
+                logger.info("Time limit reached. Stopping Locust.")
+                shutdown()
+            gevent.spawn_later(options.run_time, timelimit_stop)
+
     # Master / Slave init
     if options.slave:
         logger.info(
@@ -80,8 +97,13 @@ def launch(options, locusts):
 
     # Headful / headless init
     if options.slave:
+        if options.run_time:
+            logger.error("--run-time should be specified on the master node, and not on slave nodes")
+            sys.exit(1)
         logger.info("Slave connected in headless mode")
     elif options.no_web and not options.slave:
+        if options.run_time:
+                spawn_run_time_limit_greenlet()
         logger.info("Starting headless execution")
         runners.main.wait_for_slaves(options.expect_slaves)
         runners.main.start_hatching(options.num_clients, options.hatch_rate)
