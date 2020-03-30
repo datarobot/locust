@@ -5,6 +5,7 @@ class STATE(object):
     INIT = 'ready'
     HATCHING = 'hatching'
     RUNNING = 'running'
+    CLEANUP = 'cleanup'
     STOPPED = 'stopped'
 
 

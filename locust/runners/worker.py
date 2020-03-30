@@ -118,7 +118,7 @@ class LocustRunner(object):
                 occurence_count[locust.__name__] += 1
                 def start_locust(locust, options):
                     try:
-                        locust(options).run()
+                        locust(options).run(runner=self)
                     except GreenletExit:
                         pass
                 new_locust = self.locusts.spawn(start_locust, locust, self.options)

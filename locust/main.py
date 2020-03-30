@@ -105,7 +105,11 @@ def launch(options, locusts):
         """
         logger.info("Shutting down (exit code %s), bye." % code)
 
-        events.quitting.fire()
+        logger.info("Cleaning up runner...")
+        if runners.locust_runner is not None:
+            runners.locust_runner.quit()
+        logger.info("Running teardowns...")
+        events.quitting.fire(reverse=True)
         print_stats(runners.main.request_stats)
         print_percentile_stats(runners.main.request_stats)
         print_error_report()
