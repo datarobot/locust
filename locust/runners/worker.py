@@ -28,6 +28,7 @@ class LocustRunner(object):
         self.options = options
         self.locust_classes = locust_classes
         self.locusts = Group()
+        self.greenlet = self.locusts
         self.state = STATE.INIT
         self.hatching_greenlet = None
         self.exceptions = {}
